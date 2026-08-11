@@ -1,0 +1,13 @@
+{
+  "meta": {
+    "mode": "dev",
+    "source": "20260810-191301-crawl-sql-formats.full.md",
+    "scenario": "crawl-sql-formats",
+    "date": "20260810-191301"
+  },
+  "background": {
+    "executionContext": "",
+    "task": ""
+  },
+  "issues": []
+}

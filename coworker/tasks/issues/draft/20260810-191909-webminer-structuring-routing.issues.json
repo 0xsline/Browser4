@@ -1,0 +1,302 @@
+{
+  "meta": {
+    "source": "20260810-191909-webminer-structuring-routing.full.md",
+    "scenario": "webminer-structuring-routing",
+    "date": "20260810-191909",
+    "mode": "dev"
+  },
+  "background": {
+    "executionContext": "",
+    "task": ""
+  },
+  "issues": [
+    {
+      "number": 1,
+      "title": "Swarm worker pool permanently stalled — all tasks stuck in 'queued'",
+      "severity": "Critical",
+      "category": "Reliability",
+      "sections": [
+        {
+          "body": "1. ./b4w.ps1 swarm create --display-mode HEADLESS\n2. ./b4w.ps1 swarm query --sql @query.sql --seed-file urls.txt --refresh --wait\n3. Observe all tasks remain in 'queued' with statusCode=201 forever\n4. Follow documented recovery (swarm list --clear, swarm close, swarm create, retry) — issue persists\n5. Tried swarm submit (no X-SQL, single URL) — same result",
+          "label": "Reproduction"
+        },
+        {
+          "body": "Swarm workers should pick up queued tasks within seconds and complete page fetch/X-SQL extraction. With --wait, jobs should complete well within the 300s timeout.",
+          "label": "Expected Behavior"
+        },
+        {
+          "body": "All tasks permanently stuck in 'queued' (statusCode 201, lifecycleState 'queued'). Three attempts across two swarm sessions: 0/6, 0/3, and 0/1 jobs completed. --wait always exhausts full ~300s timeout. Documented recovery procedure does not resolve the issue.",
+          "label": "Actual Behavior"
+        },
+        {
+          "body": "Worker pool appears to never start or never dequeue tasks. The backend is a 4.13.2-SNAPSHOT development build with version mismatch vs installed runtime (4.12.3). Possible causes: (a) worker thread pool not initialized in headless mode, (b) browser context creation failing silently, (c) task queue consumer not registered. The doctor output shows no swarm-specific diagnostics. Investigation needed: check backend logs for swarm worker initialization, verify browser contexts can launch in headless mode, check if the SNAPSHOT build has a regression in swarm task dispatching.",
+          "label": "Root Cause Analysis"
+        },
+        {
+          "body": "browser4-rest/src/main/kotlin — likely in swarm session management or task dispatch layer; also check PulsarWebDriver browser context creation in headless mode",
+          "label": "Code Pointer"
+        },
+        {
+          "body": "- Add swarm worker pool health to `doctor` output (worker count, active jobs, queue depth)\n- Add a startup self-check that verifies at least one worker can process a test job\n- Surface worker-pool errors in `swarm status` output instead of silently staying 'queued'\n- Add a --timeout flag to swarm submit/query that controls the --wait polling timeout separately from the HTTP timeout\n- Implement early-exit for --wait: if no job transitions out of 'queued' within 30s, fail fast with a diagnostic message instead of burning the full timeout",
+          "label": "AI Suggested Improvement"
+        }
+      ],
+      "review": {
+        "notes": "",
+        "decision": null
+      }
+    },
+    {
+      "number": 2,
+      "title": "CLI and runtime version mismatch — 4.13.2 CLI vs 4.12.3 installed runtime",
+      "severity": "High",
+      "category": "Reliability",
+      "sections": [
+        {
+          "body": "Run `./b4w.ps1 doctor --verbose` and observe the version warnings:\n- CLI version: 4.13.2\n- Installed runtime: v4.12.3\n- Backend version: 4.13.2-SNAPSHOT\n- Warning: 'Backend is a development snapshot — it may be unstable'",
+          "label": "Reproduction"
+        },
+        {
+          "body": "CLI, installed runtime, and backend should all be the same version. The local dev build should use the locally-built JAR that matches the current source tree.",
+          "label": "Expected Behavior"
+        },
+        {
+          "body": "Three different versions in play: CLI built from source (4.13.2), previously installed runtime bundle (4.12.3), and dev-mode backend (4.13.2-SNAPSHOT). The SNAPSHOT backend may differ from the installed runtime's expectations, potentially causing the swarm worker pool failure.",
+          "label": "Actual Behavior"
+        },
+        {
+          "body": "The dev-mode auto-start launches the locally-built SNAPSHOT JAR, but a previously-installed 4.12.3 runtime bundle also exists on disk. The CLI uses the dev backend but the runtime bundle's configuration or dependencies may conflict. The `browser4-cli install` command would overwrite the installed runtime, but this wasn't run after pulling the latest source.",
+          "label": "Root Cause Analysis"
+        },
+        {
+          "body": "cli/browser4-cli/src/ — version detection and runtime path resolution logic",
+          "label": "Code Pointer"
+        },
+        {
+          "body": "- Add a prominent warning at CLI startup when versions mismatch, not just in `doctor`\n- In dev mode (running from source), skip or quarantine the installed runtime to prevent conflicts\n- Add a `--check-versions` flag that exits non-zero on mismatch for CI use\n- Document the expected workflow: after `git pull`, run `browser4-cli install` to sync runtime, or use the dev build exclusively",
+          "label": "AI Suggested Improvement"
+        }
+      ],
+      "review": {
+        "notes": "",
+        "decision": null
+      }
+    },
+    {
+      "number": 3,
+      "title": "Swarm crawl/submit extremely slow — 126s for 6 localhost pages at depth 0",
+      "severity": "Medium",
+      "category": "Reliability",
+      "sections": [
+        {
+          "body": "Create seed file with 6 localhost URLs. Run: `./b4w.ps1 crawl --seed-file seed-urls.txt --depth 0 --refresh`. Observe ~126 seconds elapsed with 'waiting for first page' messages for the first ~120 seconds, then all 6 pages complete rapidly.",
+          "label": "Reproduction"
+        },
+        {
+          "body": "Fetching 6 pages from localhost (essentially zero network latency) should complete in a few seconds. Each page is small (~15KB HTML).",
+          "label": "Expected Behavior"
+        },
+        {
+          "body": "Total elapsed: ~126 seconds. The first ~120 seconds showed 'waiting for first page (Xs elapsed, 6 URLs queued)' before any page was fetched, suggesting a long initialization or warm-up period before the crawl engine begins processing URLs.",
+          "label": "Actual Behavior"
+        },
+        {
+          "body": "Crawl has a significant cold-start latency — possibly browser context initialization, JVM warm-up, or a fixed delay before the first URL is dequeued. Once pages start processing, they complete quickly (6 pages in ~6 seconds after the first page appeared). The '4 pages found so far' message appeared at 126s, then '6 pages found' immediately after, confirming a bottleneck in crawl startup rather than per-page fetch time.",
+          "label": "Root Cause Analysis"
+        },
+        {
+          "body": "browser4-rest/ — crawl task initialization and first-page dispatch logic",
+          "label": "Code Pointer"
+        },
+        {
+          "body": "- Investigate and reduce crawl cold-start latency (browser context pre-warming, parallel initialization)\n- Show a more informative progress message during initialization (e.g., 'Initializing browser context...' vs 'waiting for first page')\n- Consider pre-initializing browser contexts when the crawl command is received rather than lazily on first page load\n- Add a progress indicator showing pages queued / pages dispatched / pages completed",
+          "label": "AI Suggested Improvement"
+        }
+      ],
+      "review": {
+        "notes": "",
+        "decision": null
+      }
+    },
+    {
+      "number": 4,
+      "title": "webminer.ps1 not found at repo root — SKILL.md path is incorrect for source-tree users",
+      "severity": "Medium",
+      "category": "Documentation",
+      "sections": [
+        {
+          "body": "From the repo root (/home/vincent/workspace/Browser4-4.13), run `./webminer.ps1 install` as documented in skills/browser4-cli/SKILL.md and skills/scent-miner/SKILL.md. The file does not exist at the repo root.",
+          "label": "Reproduction"
+        },
+        {
+          "body": "The documented command `./webminer.ps1 install` should work from the repository root, or the documentation should specify the correct relative path.",
+          "label": "Expected Behavior"
+        },
+        {
+          "body": "webminer.ps1 is located at `./skills/scent-miner/scripts/webminer.ps1`, not at the repo root. Users following the SKILL.md instructions from the repo root get 'No such file or directory'. The JAR-based fallback (`java -jar scent-miner.jar`) also fails from repo root because the JAR is at `~/.scent/webminer/lib/scent-miner.jar`.",
+          "label": "Actual Behavior"
+        },
+        {
+          "body": "SKILL.md documentation is written assuming either (a) the user is in the skills/scent-miner/scripts/ directory, or (b) the webminer.ps1 has been installed to PATH or symlinked to the repo root. Neither assumption holds for a first-time user in the repo root. The `browser4-cli install` command does not install webminer.ps1.",
+          "label": "Root Cause Analysis"
+        },
+        {
+          "body": "skills/browser4-cli/SKILL.md:301 and skills/scent-miner/SKILL.md:13 — documentation paths",
+          "label": "Code Pointer"
+        },
+        {
+          "body": "- Update SKILL.md to use the full relative path: `./skills/scent-miner/scripts/webminer.ps1 install`\n- Or add a symlink/copy step: document that users should run `ln -s skills/scent-miner/scripts/webminer.ps1 .` from repo root\n- Add the absolute path to the installed JAR in the fallback command: `java -jar ~/.scent/webminer/lib/scent-miner.jar all <dir>`\n- Consider adding webminer.ps1 to the repo root as a convenience symlink checked into git",
+          "label": "AI Suggested Improvement"
+        }
+      ],
+      "review": {
+        "notes": "",
+        "decision": null
+      }
+    },
+    {
+      "number": 5,
+      "title": "Swarm --wait timeout burns full duration with no early-exit on stalled jobs",
+      "severity": "Medium",
+      "category": "UX",
+      "sections": [
+        {
+          "body": "Submit a swarm query with --wait when the worker pool is stalled (or any scenario where no jobs make progress). The --wait flag will poll for the full ~300 seconds even though 0 jobs have ever transitioned out of 'queued'.",
+          "label": "Reproduction"
+        },
+        {
+          "body": "--wait should detect that no progress is being made and fail fast (e.g., if no job leaves 'queued' within 60s, abort with a meaningful error).",
+          "label": "Expected Behavior"
+        },
+        {
+          "body": "--wait prints '0/N job(s) completed' every 30 seconds for the full ~300 second duration, then exits with 'Timeout after 301s. 0 of N job(s) completed.' The user waits 5 minutes to learn something they could have known after 30-60 seconds.",
+          "label": "Actual Behavior"
+        },
+        {
+          "body": "The --wait polling loop simply counts completed jobs vs total and checks elapsed time against a fixed 300s timeout. It has no stall detection: if completed count stays at 0 for an extended period, it doesn't recognize this as a stall condition.",
+          "label": "Root Cause Analysis"
+        },
+        {
+          "body": "cli/browser4-cli/src/ — swarm --wait polling loop",
+          "label": "Code Pointer"
+        },
+        {
+          "body": "- Implement stall detection: if 0 jobs have completed after 60s, exit early with 'No jobs have started processing. The worker pool may be stalled. Check `swarm list` and `doctor` for diagnostics.'\n- Add a --wait-timeout flag to let users control the polling duration\n- Show per-job status in --wait output (queued/processing/completed counts) not just completed/total\n- Consider making the polling interval adaptive: faster (5s) initially, slower (15s) after the first minute",
+          "label": "AI Suggested Improvement"
+        }
+      ],
+      "review": {
+        "notes": "",
+        "decision": null
+      }
+    },
+    {
+      "number": 6,
+      "title": "No swarm diagnostics in doctor output — can't troubleshoot stalled workers",
+      "severity": "Medium",
+      "category": "Discoverability",
+      "sections": [
+        {
+          "body": "When swarm tasks are stuck in 'queued', run `./b4w.ps1 doctor --verbose`. The output shows build info, LLM status, and general backend logs, but nothing about swarm worker pool health, active browser contexts, queue depth, or worker thread status.",
+          "label": "Reproduction"
+        },
+        {
+          "body": "`doctor` or `doctor --verbose` should include swarm-specific diagnostics: number of worker threads, active browser contexts, queue depth, last job processing time, any worker errors.",
+          "label": "Expected Behavior"
+        },
+        {
+          "body": "No swarm-related information appears in doctor output. Users have no built-in way to diagnose why swarm jobs aren't being processed.",
+          "label": "Actual Behavior"
+        },
+        {
+          "body": "The doctor command was designed before swarm became a core feature, or swarm diagnostics were never integrated. The doctor output covers build info, LLM config, and log tails, but has no category for swarm/job-queue health.",
+          "label": "Root Cause Analysis"
+        },
+        {
+          "body": "browser4-rest/ — doctor diagnostics endpoint; cli/browser4-cli/src/ — doctor command output formatting",
+          "label": "Code Pointer"
+        },
+        {
+          "body": "- Add a 'Swarm Health' section to doctor output: worker pool size, active workers, queued job count, last job completion time\n- Add backend health endpoint for swarm status that the CLI can query\n- Include swarm worker errors in the log tail shown by doctor --verbose\n- Add `doctor swarm` subcommand for focused swarm diagnostics",
+          "label": "AI Suggested Improvement"
+        }
+      ],
+      "review": {
+        "notes": "",
+        "decision": null
+      }
+    },
+    {
+      "number": 7,
+      "title": "htmlsnapshot export help text does not clearly state prior capture requirement",
+      "severity": "Low",
+      "category": "Discoverability",
+      "sections": [
+        {
+          "body": "Run `./b4w.ps1 htmlsnapshot export --help` or read the main help. The description says 'Export snapshot HTML from Browser4's page storage to a local file' but does not explicitly state that a prior `htmlsnapshot` (capture) is required. A new user might try `htmlsnapshot export --file out.html` immediately after `goto` without first capturing.",
+          "label": "Reproduction"
+        },
+        {
+          "body": "The help text should clearly state the prerequisite: 'Requires a prior htmlsnapshot capture. Run htmlsnapshot first to store the page HTML, then export it.'",
+          "label": "Expected Behavior"
+        },
+        {
+          "body": "The help text describes what export does but not when it can be used. Users learn about the capture prerequisite from the SKILL.md decision tree table (§4a), not from the command's own help. If they haven't read the full SKILL.md, they'd encounter a confusing error.",
+          "label": "Actual Behavior"
+        },
+        {
+          "body": "The help text generation in the CLI focuses on describing what each command does, not on prerequisites. The SKILL.md §4a table is comprehensive but users may not read it before trying commands.",
+          "label": "Root Cause Analysis"
+        },
+        {
+          "body": "cli/browser4-cli/src/ — help text definitions for htmlsnapshot subcommands",
+          "label": "Code Pointer"
+        },
+        {
+          "body": "- Add a 'Prerequisites' line to command help: 'Prerequisite: htmlsnapshot capture'\n- When export is called without a prior capture, include 'Run htmlsnapshot first to capture the page' in the error message\n- Add a --capture-and-export convenience flag that does capture+export in one step",
+          "label": "AI Suggested Improvement"
+        }
+      ],
+      "review": {
+        "notes": "",
+        "decision": null
+      }
+    },
+    {
+      "number": 8,
+      "title": "Swarm close causes unexpected navigation in DEFAULT browser session",
+      "severity": "Low",
+      "category": "UX",
+      "sections": [
+        {
+          "body": "1. Open a DEFAULT session and navigate to a page\n2. Create and use a swarm session\n3. Run `swarm close`\n4. Observe the DEFAULT session's browser navigates to a different page (the last page from the swarm or a reconnection)",
+          "label": "Reproduction"
+        },
+        {
+          "body": "Closing a swarm session should not affect other browser sessions. The DEFAULT session should remain on its current page.",
+          "label": "Expected Behavior"
+        },
+        {
+          "body": "After `swarm close`, the output shows a snapshot from the DEFAULT session at a different URL than where it was left. Example: DEFAULT was on the MockSite home page, but after swarm close, it shows 'Category: Electronics'. This is confusing and could cause data loss if the user was in the middle of a workflow on the DEFAULT session.",
+          "label": "Actual Behavior"
+        },
+        {
+          "body": "When the swarm session closes, it may trigger a session reconnection or browser state refresh that affects the DEFAULT session. The snapshot auto-capture on DEFAULT after swarm close suggests the CLI is inadvertently targeting the DEFAULT session after swarm operations.",
+          "label": "Root Cause Analysis"
+        },
+        {
+          "body": "cli/browser4-cli/src/ — swarm close command handler and session state management",
+          "label": "Code Pointer"
+        },
+        {
+          "body": "- Isolate swarm session state from other sessions — closing swarm should not trigger any action on DEFAULT\n- If the navigation is caused by auto-snapshot, suppress auto-snapshot on non-swarm sessions during swarm close\n- Add a test: verify DEFAULT session URL is unchanged after swarm create → swarm close cycle",
+          "label": "AI Suggested Improvement"
+        }
+      ],
+      "review": {
+        "notes": "",
+        "decision": null
+      }
+    }
+  ]
+}

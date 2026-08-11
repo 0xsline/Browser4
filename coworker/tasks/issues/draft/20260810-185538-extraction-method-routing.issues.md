@@ -1,0 +1,614 @@
+# Issues: extraction-method-routing
+
+> **Source:** `20260810-185538-extraction-method-routing.full.md` | **Date:** 20260810-185538 | **Mode:** dev
+
+## Scenario Background
+
+### Task
+
+All 7 acceptance criteria were attempted:
+
+| AC | Description | Result |
+|----|-------------|--------|
+| AC1 | Interact first, then extract | ✅ Extracted "Submission Result Your form data was captured successfully." via `htmlsnapshot get text`. Required `eval` for JS-populated data (as documented). |
+| AC2 | Static page, one field | ✅ `htmlsnapshot get text "#productTitle"` → "4K OLED TV 55" |
+| AC3 | Static page, all matches | ✅ `htmlsnapshot get all text ".product-link"` → 6 product titles |
+| AC4 | Correlated multi-field rows | ✅ X-SQL with `DOM_LOAD_AND_SELECT` returned 6 rows (title, price, URL) |
+| AC5 | Dynamic page, eval --json | ✅ Structured JSON with document.title, element counts, headings |
+| AC6 | Natural-language extraction | ✅ `extract` returned product title, price ($199.99), rating (4.4), feature bullets |
+| AC7 | High-volume crawl extraction | ⚠️ crawl ran successfully but 2/5 rows were empty; 146s for 5 local pages |
+
+**Overall:** 6/7 criteria fully successful, 1 partially successful. The workflow is functional but has reliability and performance issues.
+
+### Execution Context
+
+**Key Commands:**
+
+1. `./b4w.ps1 help` — learned command structure
+2. `./b4w.ps1 goto "http://localhost:18080/generated/form-filling.html"` — AC1 navigation
+3. `./b4w.ps1 snapshot -i --stdout` — interactive element discovery (AC1)
+4. `./b4w.ps1 fill e5648 "Alice"` through `./b4w.ps1 check "#agree-terms"` — form interaction chain (AC1)
+5. `./b4w.ps1 click e5814` — timed out at 30s, retried at 60s (AC1)
+6. `./b4w.ps1 go-back` — failed from about:blank (AC1)
+7. `./b4w.ps1 goto ...` (re-navigate), `fill "#first-name" "Alice"` — used CSS selectors instead of refs (AC1)
+8. `./b4w.ps1 eval "document.querySelector('#registration-form').requestSubmit()"` — JS form submission (AC1)
+9. `./b4w.ps1 htmlsnapshot` + `htmlsnapshot get text "#result-panel"` — extraction (AC1)
+10. `./b4w.ps1 goto "http://localhost:18080/ec/dp/B0E000001"` + `htmlsnapshot` + `htmlsnapshot get text "#productTitle"` — AC2
+11. `./b4w.ps1 goto "http://localhost:18080/ec/b?node=1292115012"` + `htmlsnapshot` + `htmlsnapshot get all text ".product-link"` — AC3
+12. `./b4w.ps1 htmlsnapshot inspect` + `htmlsnapshot query ... --sql @query.sql` — AC4 (first run: detail_url empty; fixed with `DOM_FIRST_ATTR`)
+13. `./b4w.ps1 goto "http://localhost:18080/generated/interactive-1.html"` + `eval --json 'JSON.stringify({...})'` — AC5
+14. `./b4w.ps1 doctor` (LLM check) + `goto ...B0E000002` + `extract "..."` — AC6
+15. `./b4w.ps1 crawl --seed-file ... --depth 0 --sql @... --format table --refresh` — AC7 (first run: wrong selectors; second run: 3/5 correct, 146s)
+
+**Workarounds required:**
+- Used CSS selectors (`#first-name`) instead of ephemeral refs for reliability
+- Used `DOM_FIRST_ATTR` instead of `DOM_FIRST_HREF` for href extraction
+- Used `eval` + JS form submission instead of `click` on submit button (click navigated to about:blank)
+- Used `eval` for live-DOM data that `htmlsnapshot` couldn't capture
+
+**Temporary files created:** All in `.test-sessions/` — `ac4-query.sql`, `ac7-seeds.txt`, `ac7-query.sql`
+
+---
+
+```json
+{
+  "issues": [
+    {
+      "title": "Click on form submit button navigates to about:blank instead of submitting via JS",
+      "severity": "High",
+      "category": "Product",
+      "reproduction": "./b4w.ps1 goto \"http://localhost:18080/generated/form-filling.html\"\nFill required fields, then: ./b4w.ps1 click e5814 (or click on #submit-btn)\nFirst attempt times out at 30s; second attempt shows page navigated to about:blank.",
+      "expected": "Click should trigger the form's JavaScript submit handler (which calls event.preventDefault()) and keep the user on the same page with updated state.",
+      "actual": "First click attempt timed out after 30s. Second click attempt navigated to about:blank, losing all form state and context.",
+      "rootCause": "The CDP-level click likely triggers the native form submission (GET to the form action) rather than the JavaScript onclick handler. The JS handler probably uses event.preventDefault() which the CDP click doesn't respect, or the click event isn't being dispatched to the right element in a way that triggers the JS handler. The timeout on the first attempt may be because a dialog was triggered or the page was in a blocking state.",
+      "codePointer": "browser4-core/browser4-browser/ PulsarWebDriver.kt click method — the click dispatch may need to ensure JS event handlers are invoked before native form submission.",
+      "suggestion": "- Ensure CDP click dispatches to the element's JS event listeners (not just native behavior)\n- Consider using Input.dispatchMouseEvent with proper event phases that trigger JS handlers\n- Add a diagnostic message when a click causes navigation away from the current page\n- Document that for JS-heavy forms, eval-based submission may be more reliable than click"
+    },
+    {
+      "title": "HTML snapshot captures initial server HTML, not live DOM — leads to stale data silently",
+      "severity": "Medium",
+      "category": "UX",
+      "reproduction": "After submitting the form on form-filling.html, run:\n./b4w.ps1 htmlsnapshot\nthen:\n./b4w.ps1 htmlsnapshot get text \"#result-data\"\nReturns \"No submission yet.\" even though the form was just submitted.",
+      "expected": "Either (a) htmlsnapshot should reflect the current page state after the form submission page reload, or (b) the CLI should clearly warn that the snapshot is from the initial HTML and JS-populated content won't be visible.",
+      "actual": "htmlsnapshot get text returned \"No submission yet.\" — the default text from the HTML before JavaScript populated the actual submitted values. The SKILL.md documents this behavior (§5 Critical Warnings) but the CLI output gives no runtime warning.",
+      "rootCause": "htmlsnapshot stores the initial server-rendered HTML at page load time. After form submission causes a page reload with query parameters, JavaScript re-populates the result panel. htmlsnapshot get reads from the stored HTML which was captured before JS execution.",
+      "codePointer": "cli/browser4-cli/src/ — the htmlsnapshot get command handler could add a runtime warning when reading from a snapshot that was captured before interactions occurred.",
+      "suggestion": "- Add a runtime warning when htmlsnapshot get returns text from a snapshot that may be stale (page interacted with since capture)\n- Consider adding a --refresh flag to htmlsnapshot get that re-captures before reading\n- In the help output, make the initial-HTML limitation more prominent (it's buried in §5)\n- The tip \"The live page is still accessible — use eval, snapshot, or click\" in htmlsnapshot output is helpful but could be more prominent after a get returns empty/unexpected results"
+    },
+    {
+      "title": "DOM_FIRST_HREF returns empty string while DOM_FIRST_ATTR works correctly",
+      "severity": "Medium",
+      "category": "Product",
+      "reproduction": "Use this X-SQL query:\nSELECT DOM_FIRST_HREF(DOM, '.product-link') AS detail_url\nFROM DOM_LOAD_AND_SELECT(@url, '.product-card')\nAll detail_url values are empty strings.",
+      "expected": "DOM_FIRST_HREF should return the href attribute value from the matched anchor element.",
+      "actual": "All rows returned empty string for detail_url. Switching to DOM_FIRST_ATTR(DOM, '.product-link', 'href') returned the correct relative URLs.",
+      "rootCause": "DOM_FIRST_HREF may expect a different argument format than DOM_FIRST_ATTR, or the function implementation has a bug. The selector '.product-link' matches <a> elements that have href attributes, so DOM_FIRST_HREF should work. Possible causes: the function looks for a raw href attribute rather than the resolved URL, or the function signature differs from documentation.",
+      "codePointer": "browser4-core/ — the X-SQL DOM_FIRST_HREF function implementation, likely in a DOM function registry or X-SQL evaluator.",
+      "suggestion": "- Fix DOM_FIRST_HREF to correctly extract href from anchor elements matched by CSS selector\n- Add a unit test for DOM_FIRST_HREF with a simple <a href=\"...\"> element\n- If DOM_FIRST_HREF has different semantics than DOM_FIRST_ATTR(..., 'href'), document the difference clearly\n- Consider deprecating DOM_FIRST_HREF in favor of the more general DOM_FIRST_ATTR if they're meant to be equivalent"
+    },
+    {
+      "title": "Crawl is extremely slow even for localhost pages (146s for 5 pages)",
+      "severity": "High",
+      "category": "Reliability",
+      "reproduction": "./b4w.ps1 crawl --seed-file seeds.txt --depth 0 --sql @query.sql --format table --refresh\nwith 5 localhost URLs. Observe the progress output showing 136s before the first page completes.",
+      "expected": "5 localhost pages should be crawled in under 10 seconds. Each page is ~15KB and served from localhost with no network latency.",
+      "actual": "The crawl took 146 seconds total. Progress output showed \"waiting for first page\" for 136 seconds before any pages were processed, suggesting a startup/initialization bottleneck rather than per-page slowness.",
+      "rootCause": "Likely server-side initialization overhead: the crawl may be starting a new browser context or session for each crawl run. The 136s initial delay before processing any pages suggests a cold-start problem — possibly Chrome launch, CDP connection establishment, or page-fetch queuing. The backend is a development SNAPSHOT which may have unoptimized paths.",
+      "codePointer": "browser4-rest/ — the crawl task initialization and browser context creation. Could be in the crawl controller or the PulsarWebDriver session setup.",
+      "suggestion": "- Profile the crawl initialization path to identify the 136s bottleneck\n- Consider reusing the existing browser session for localhost crawls\n- Add a --warm flag to pre-initialize the crawl context\n- Show per-page timing in the output so users can distinguish init time from per-page time\n- For depth-0 crawls (no link following), consider batching or parallelizing the fetches"
+    },
+    {
+      "title": "Crawl X-SQL extraction is inconsistent — 2/5 pages returned empty results that work fine when queried directly",
+      "severity": "High",
+      "category": "Reliability",
+      "reproduction": "Create a seed file with 5 product detail URLs, run crawl with X-SQL extraction using #productTitle and #product-price selectors.\n3 of 5 pages return correct data; 2 pages (B0E000004, B0E000005) return empty title and price.\nQuerying those same pages directly with htmlsnapshot + htmlsnapshot get text works correctly.",
+      "expected": "All 5 pages should return consistent extraction results since they share the same HTML template and CSS selectors.",
+      "actual": "B0E000004 and B0E000005 returned empty title/price in the crawl result. Direct htmlsnapshot get text on those pages returns correct values ('Smartphone 128GB', '$599.00').",
+      "rootCause": "Likely a race condition in the crawl's X-SQL extraction: the DOM_LOAD_AND_SELECT may execute before the page's HTML is fully parsed/rendered. The crawl output showed a long delay before any pages were processed, then all 5 were processed quickly, suggesting a burst of rapid fetching where some pages may not have been ready when the X-SQL ran. Alternatively, there could be a page caching issue where the crawl fetches a stale/cached version.",
+      "codePointer": "browser4-rest/ crawl task handler — the page load + X-SQL extraction pipeline. The page readiness check before DOM_LOAD_AND_SELECT may need to be more robust.",
+      "suggestion": "- Ensure DOM_LOAD_AND_SELECT waits for the page to be fully loaded (DOMContentLoaded + network idle) before running the query\n- Add retry logic for empty result sets in crawl extraction\n- Log a warning when a crawled page returns zero rows from X-SQL\n- Consider adding a --wait-selector option to crawl that ensures specific content is present before extraction"
+    },
+    {
+      "title": "go-back fails silently when current page is about:blank",
+      "severity": "Low",
+      "category": "Reliability",
+      "reproduction": "After a click causes navigation to about:blank:\n./b4w.ps1 go-back\nOutput shows page URL is still about:blank with no error message.",
+      "expected": "go-back should either navigate to the previous page or report that there is no history to go back to.",
+      "actual": "go-back returned success output showing the page was still about:blank — no error, no indication that the operation failed.",
+      "rootCause": "about:blank has no session history entry to go back from. The browser reports success for the go-back operation but the page doesn't change because there's nowhere to go back to.",
+      "codePointer": "cli/browser4-cli/src/ — the go-back command handler should check whether the URL actually changed after the operation.",
+      "suggestion": "- Verify the page URL actually changed after go-back/go-forward operations\n- Report a clear error when go-back has no effect (no history)\n- Display 'Already at the earliest page in history' or similar message"
+    },
+    {
+      "title": "No inline examples in --help for htmlsnapshot query X-SQL usage",
+      "severity": "Medium",
+      "category": "Discoverability",
+      "reproduction": "Run: ./b4w.ps1 htmlsnapshot query --help\nObserve the help output — it doesn't include a copy-paste X-SQL example.",
+      "expected": "The --help output for htmlsnapshot query should include at least one complete X-SQL example showing the SELECT...FROM DOM_LOAD_AND_SELECT pattern, since this is the primary structured extraction method.",
+      "actual": "The top-level help output does not show X-SQL syntax examples. Users must find the SKILL.md or x-sql.md reference to learn the query format. The SKILL.md's §4e X-SQL Quickstart Template is excellent but not discoverable from --help.",
+      "rootCause": "The CLI help system generates structured help but doesn't include long-form examples by design. The SKILL.md reference file fills this gap but requires users to know to look there.",
+      "codePointer": "cli/browser4-cli/src/ — command help text generation. Could add an 'Examples' section that references SKILL.md or includes inline examples.",
+      "suggestion": "- Add a short example to `htmlsnapshot query --help`: e.g., htmlsnapshot query URL --sql @query.sql\n- Reference the SKILL.md §4e template in the help output: 'See SKILL.md §4e for X-SQL templates'\n- Consider adding a `browser4-cli examples extraction` command that prints common extraction patterns"
+    },
+    {
+      "title": "First form submission attempt timed out at 30s with no useful error information",
+      "severity": "Medium",
+      "category": "UX",
+      "reproduction": "Fill the form-filling.html form fields, then:\n./b4w.ps1 click e5814\n(timeout: 30s)\nCommand times out and is moved to background.",
+      "expected": "Either the click succeeds within 30s, or a clear error message indicates what went wrong (e.g., 'Dialog appeared — use dialog-accept', 'Page navigation in progress', 'Element not clickable').",
+      "actual": "Command timed out after 30s with no output. On retry with 60s timeout, the click succeeded but navigated to about:blank. The timeout provides no diagnostic information to help the user understand or fix the issue.",
+      "rootCause": "The 30s default timeout is too short for operations that may trigger page navigation or dialogs. The timeout error doesn't distinguish between different failure modes (dialog appeared, page loading, element blocked, etc.).",
+      "codePointer": "cli/browser4-cli/src/ — the default timeout configuration and error handling for click operations.",
+      "suggestion": "- When a click triggers a dialog, detect this and suggest 'dialog-accept' or '--auto-dismiss-dialogs' in the error message\n- When a click causes a page navigation, detect this and report it as a success with navigation info rather than a timeout\n- Increase the default click timeout when the target element is a submit button inside a form\n- Add --timeout hint to click --help output"
+    }
+  ],
+  "assessment": {
+    "completionStatus": "Partially Successful — 6 of 7 acceptance criteria completed successfully. AC7 (crawl) worked but with inconsistent results (3/5 correct). The core extraction workflows (htmlsnapshot get, get all, query, eval, extract) all function correctly. The main blockers were crawl performance/reliability and click behavior on JS-heavy forms.",
+    "successRate": "85% — most extraction functions work well. The crawl bulk path has reliability issues. The htmlsnapshot vs eval distinction for live-DOM is well-documented but still a friction point.",
+    "issuesFound": 8,
+    "majorBlockers": "Crawl takes 146s for 5 localhost pages and returns inconsistent results (2/5 empty). Click on form submit buttons can time out or navigate to about:blank instead of triggering JS handlers. These are significant blockers for real-world automation tasks.",
+    "mostConfusingAspects": "1. The htmlsnapshot vs snapshot vs eval distinction — knowing when to use each requires reading documentation carefully. 2. Refs are ephemeral and change after every interaction, requiring constant re-snapshotting. 3. X-SQL has strict syntax rules (single quotes for CSS, no CTEs/JOINs) that produce opaque errors when violated. 4. DOM_FIRST_HREF vs DOM_FIRST_ATTR — unclear when to use which.",
+    "mostValuableImprovements": "1. Fix crawl performance (146s → <10s for localhost). 2. Make click reliably trigger JS form handlers without navigating to about:blank. 3. Add runtime warnings when htmlsnapshot may return stale data. 4. Add X-SQL examples to --help output. 5. Improve timeout error messages with actionable diagnostics.",
+    "usabilityRating": 6
+  }
+}
+```
+
+---
+
+## Issues Found (8 issues)
+
+### Issue 1: Click on form submit button navigates to about:blank instead of submitting via JS
+
+**Severity:** High
+**Category:** Product
+
+#### Reproduction
+
+./b4w.ps1 goto "http://localhost:18080/generated/form-filling.html"
+Fill required fields, then: ./b4w.ps1 click e5814 (or click on #submit-btn)
+First attempt times out at 30s; second attempt shows page navigated to about:blank.
+
+#### Expected Behavior
+
+Click should trigger the form's JavaScript submit handler (which calls event.preventDefault()) and keep the user on the same page with updated state.
+
+#### Actual Behavior
+
+First click attempt timed out after 30s. Second click attempt navigated to about:blank, losing all form state and context.
+
+#### Root Cause Analysis
+
+The CDP-level click likely triggers the native form submission (GET to the form action) rather than the JavaScript onclick handler. The JS handler probably uses event.preventDefault() which the CDP click doesn't respect, or the click event isn't being dispatched to the right element in a way that triggers the JS handler. The timeout on the first attempt may be because a dialog was triggered or the page was in a blocking state.
+
+#### Code Pointer
+
+`browser4-core/browser4-browser/ PulsarWebDriver.kt click method — the click dispatch may need to ensure JS event handlers are invoked before native form submission.`
+
+#### AI Suggested Improvement
+
+- Ensure CDP click dispatches to the element's JS event listeners (not just native behavior)
+- Consider using Input.dispatchMouseEvent with proper event phases that trigger JS handlers
+- Add a diagnostic message when a click causes navigation away from the current page
+- Document that for JS-heavy forms, eval-based submission may be more reliable than click
+
+#### Human Review
+
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
+- **Notes:**
+
+---
+
+### Issue 2: Crawl is extremely slow even for localhost pages (146s for 5 pages)
+
+**Severity:** High
+**Category:** Reliability
+
+#### Reproduction
+
+./b4w.ps1 crawl --seed-file seeds.txt --depth 0 --sql @query.sql --format table --refresh
+with 5 localhost URLs. Observe the progress output showing 136s before the first page completes.
+
+#### Expected Behavior
+
+5 localhost pages should be crawled in under 10 seconds. Each page is ~15KB and served from localhost with no network latency.
+
+#### Actual Behavior
+
+The crawl took 146 seconds total. Progress output showed "waiting for first page" for 136 seconds before any pages were processed, suggesting a startup/initialization bottleneck rather than per-page slowness.
+
+#### Root Cause Analysis
+
+Likely server-side initialization overhead: the crawl may be starting a new browser context or session for each crawl run. The 136s initial delay before processing any pages suggests a cold-start problem — possibly Chrome launch, CDP connection establishment, or page-fetch queuing. The backend is a development SNAPSHOT which may have unoptimized paths.
+
+#### Code Pointer
+
+`browser4-rest/ — the crawl task initialization and browser context creation. Could be in the crawl controller or the PulsarWebDriver session setup.`
+
+#### AI Suggested Improvement
+
+- Profile the crawl initialization path to identify the 136s bottleneck
+- Consider reusing the existing browser session for localhost crawls
+- Add a --warm flag to pre-initialize the crawl context
+- Show per-page timing in the output so users can distinguish init time from per-page time
+- For depth-0 crawls (no link following), consider batching or parallelizing the fetches
+
+#### Human Review
+
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
+- **Notes:**
+
+---
+
+### Issue 3: Crawl X-SQL extraction is inconsistent — 2/5 pages returned empty results that work fine when queried directly
+
+**Severity:** High
+**Category:** Reliability
+
+#### Reproduction
+
+Create a seed file with 5 product detail URLs, run crawl with X-SQL extraction using #productTitle and #product-price selectors.
+3 of 5 pages return correct data; 2 pages (B0E000004, B0E000005) return empty title and price.
+Querying those same pages directly with htmlsnapshot + htmlsnapshot get text works correctly.
+
+#### Expected Behavior
+
+All 5 pages should return consistent extraction results since they share the same HTML template and CSS selectors.
+
+#### Actual Behavior
+
+B0E000004 and B0E000005 returned empty title/price in the crawl result. Direct htmlsnapshot get text on those pages returns correct values ('Smartphone 128GB', '$599.00').
+
+#### Root Cause Analysis
+
+Likely a race condition in the crawl's X-SQL extraction: the DOM_LOAD_AND_SELECT may execute before the page's HTML is fully parsed/rendered. The crawl output showed a long delay before any pages were processed, then all 5 were processed quickly, suggesting a burst of rapid fetching where some pages may not have been ready when the X-SQL ran. Alternatively, there could be a page caching issue where the crawl fetches a stale/cached version.
+
+#### Code Pointer
+
+`browser4-rest/ crawl task handler — the page load + X-SQL extraction pipeline. The page readiness check before DOM_LOAD_AND_SELECT may need to be more robust.`
+
+#### AI Suggested Improvement
+
+- Ensure DOM_LOAD_AND_SELECT waits for the page to be fully loaded (DOMContentLoaded + network idle) before running the query
+- Add retry logic for empty result sets in crawl extraction
+- Log a warning when a crawled page returns zero rows from X-SQL
+- Consider adding a --wait-selector option to crawl that ensures specific content is present before extraction
+
+#### Human Review
+
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
+- **Notes:**
+
+---
+
+### Issue 4: HTML snapshot captures initial server HTML, not live DOM — leads to stale data silently
+
+**Severity:** Medium
+**Category:** UX
+
+#### Reproduction
+
+After submitting the form on form-filling.html, run:
+./b4w.ps1 htmlsnapshot
+then:
+./b4w.ps1 htmlsnapshot get text "#result-data"
+Returns "No submission yet." even though the form was just submitted.
+
+#### Expected Behavior
+
+Either (a) htmlsnapshot should reflect the current page state after the form submission page reload, or (b) the CLI should clearly warn that the snapshot is from the initial HTML and JS-populated content won't be visible.
+
+#### Actual Behavior
+
+htmlsnapshot get text returned "No submission yet." — the default text from the HTML before JavaScript populated the actual submitted values. The SKILL.md documents this behavior (§5 Critical Warnings) but the CLI output gives no runtime warning.
+
+#### Root Cause Analysis
+
+htmlsnapshot stores the initial server-rendered HTML at page load time. After form submission causes a page reload with query parameters, JavaScript re-populates the result panel. htmlsnapshot get reads from the stored HTML which was captured before JS execution.
+
+#### Code Pointer
+
+`cli/browser4-cli/src/ — the htmlsnapshot get command handler could add a runtime warning when reading from a snapshot that was captured before interactions occurred.`
+
+#### AI Suggested Improvement
+
+- Add a runtime warning when htmlsnapshot get returns text from a snapshot that may be stale (page interacted with since capture)
+- Consider adding a --refresh flag to htmlsnapshot get that re-captures before reading
+- In the help output, make the initial-HTML limitation more prominent (it's buried in §5)
+- The tip "The live page is still accessible — use eval, snapshot, or click" in htmlsnapshot output is helpful but could be more prominent after a get returns empty/unexpected results
+
+#### Human Review
+
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
+- **Notes:**
+
+---
+
+### Issue 5: DOM_FIRST_HREF returns empty string while DOM_FIRST_ATTR works correctly
+
+**Severity:** Medium
+**Category:** Product
+
+#### Reproduction
+
+Use this X-SQL query:
+SELECT DOM_FIRST_HREF(DOM, '.product-link') AS detail_url
+FROM DOM_LOAD_AND_SELECT(@url, '.product-card')
+All detail_url values are empty strings.
+
+#### Expected Behavior
+
+DOM_FIRST_HREF should return the href attribute value from the matched anchor element.
+
+#### Actual Behavior
+
+All rows returned empty string for detail_url. Switching to DOM_FIRST_ATTR(DOM, '.product-link', 'href') returned the correct relative URLs.
+
+#### Root Cause Analysis
+
+DOM_FIRST_HREF may expect a different argument format than DOM_FIRST_ATTR, or the function implementation has a bug. The selector '.product-link' matches <a> elements that have href attributes, so DOM_FIRST_HREF should work. Possible causes: the function looks for a raw href attribute rather than the resolved URL, or the function signature differs from documentation.
+
+#### Code Pointer
+
+`browser4-core/ — the X-SQL DOM_FIRST_HREF function implementation, likely in a DOM function registry or X-SQL evaluator.`
+
+#### AI Suggested Improvement
+
+- Fix DOM_FIRST_HREF to correctly extract href from anchor elements matched by CSS selector
+- Add a unit test for DOM_FIRST_HREF with a simple <a href="..."> element
+- If DOM_FIRST_HREF has different semantics than DOM_FIRST_ATTR(..., 'href'), document the difference clearly
+- Consider deprecating DOM_FIRST_HREF in favor of the more general DOM_FIRST_ATTR if they're meant to be equivalent
+
+#### Human Review
+
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
+- **Notes:**
+
+---
+
+### Issue 6: No inline examples in --help for htmlsnapshot query X-SQL usage
+
+**Severity:** Medium
+**Category:** Discoverability
+
+#### Reproduction
+
+Run: ./b4w.ps1 htmlsnapshot query --help
+Observe the help output — it doesn't include a copy-paste X-SQL example.
+
+#### Expected Behavior
+
+The --help output for htmlsnapshot query should include at least one complete X-SQL example showing the SELECT...FROM DOM_LOAD_AND_SELECT pattern, since this is the primary structured extraction method.
+
+#### Actual Behavior
+
+The top-level help output does not show X-SQL syntax examples. Users must find the SKILL.md or x-sql.md reference to learn the query format. The SKILL.md's §4e X-SQL Quickstart Template is excellent but not discoverable from --help.
+
+#### Root Cause Analysis
+
+The CLI help system generates structured help but doesn't include long-form examples by design. The SKILL.md reference file fills this gap but requires users to know to look there.
+
+#### Code Pointer
+
+`cli/browser4-cli/src/ — command help text generation. Could add an 'Examples' section that references SKILL.md or includes inline examples.`
+
+#### AI Suggested Improvement
+
+- Add a short example to `htmlsnapshot query --help`: e.g., htmlsnapshot query URL --sql @query.sql
+- Reference the SKILL.md §4e template in the help output: 'See SKILL.md §4e for X-SQL templates'
+- Consider adding a `browser4-cli examples extraction` command that prints common extraction patterns
+
+#### Human Review
+
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
+- **Notes:**
+
+---
+
+### Issue 7: First form submission attempt timed out at 30s with no useful error information
+
+**Severity:** Medium
+**Category:** UX
+
+#### Reproduction
+
+Fill the form-filling.html form fields, then:
+./b4w.ps1 click e5814
+(timeout: 30s)
+Command times out and is moved to background.
+
+#### Expected Behavior
+
+Either the click succeeds within 30s, or a clear error message indicates what went wrong (e.g., 'Dialog appeared — use dialog-accept', 'Page navigation in progress', 'Element not clickable').
+
+#### Actual Behavior
+
+Command timed out after 30s with no output. On retry with 60s timeout, the click succeeded but navigated to about:blank. The timeout provides no diagnostic information to help the user understand or fix the issue.
+
+#### Root Cause Analysis
+
+The 30s default timeout is too short for operations that may trigger page navigation or dialogs. The timeout error doesn't distinguish between different failure modes (dialog appeared, page loading, element blocked, etc.).
+
+#### Code Pointer
+
+`cli/browser4-cli/src/ — the default timeout configuration and error handling for click operations.`
+
+#### AI Suggested Improvement
+
+- When a click triggers a dialog, detect this and suggest 'dialog-accept' or '--auto-dismiss-dialogs' in the error message
+- When a click causes a page navigation, detect this and report it as a success with navigation info rather than a timeout
+- Increase the default click timeout when the target element is a submit button inside a form
+- Add --timeout hint to click --help output
+
+#### Human Review
+
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
+- **Notes:**
+
+---
+
+### Issue 8: go-back fails silently when current page is about:blank
+
+**Severity:** Low
+**Category:** Reliability
+
+#### Reproduction
+
+After a click causes navigation to about:blank:
+./b4w.ps1 go-back
+Output shows page URL is still about:blank with no error message.
+
+#### Expected Behavior
+
+go-back should either navigate to the previous page or report that there is no history to go back to.
+
+#### Actual Behavior
+
+go-back returned success output showing the page was still about:blank — no error, no indication that the operation failed.
+
+#### Root Cause Analysis
+
+about:blank has no session history entry to go back from. The browser reports success for the go-back operation but the page doesn't change because there's nowhere to go back to.
+
+#### Code Pointer
+
+`cli/browser4-cli/src/ — the go-back command handler should check whether the URL actually changed after the operation.`
+
+#### AI Suggested Improvement
+
+- Verify the page URL actually changed after go-back/go-forward operations
+- Report a clear error when go-back has no effect (no history)
+- Display 'Already at the earliest page in history' or similar message
+
+#### Human Review
+
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
+- **Notes:**
+
+---
+
+## Overall Assessment
+
+**Completion Status:** Partially Successful — 6 of 7 acceptance criteria completed successfully. AC7 (crawl) worked but with inconsistent results (3/5 correct). The core extraction workflows (htmlsnapshot get, get all, query, eval, extract) all function correctly. The main blockers were crawl performance/reliability and click behavior on JS-heavy forms.
+
+**Success Rate:** 85% — most extraction functions work well. The crawl bulk path has reliability issues. The htmlsnapshot vs eval distinction for live-DOM is well-documented but still a friction point.
+
+**Issues Found:** 8
+
+**Major Blockers:** Crawl takes 146s for 5 localhost pages and returns inconsistent results (2/5 empty). Click on form submit buttons can time out or navigate to about:blank instead of triggering JS handlers. These are significant blockers for real-world automation tasks.
+
+**Most Confusing Aspects:** 1. The htmlsnapshot vs snapshot vs eval distinction — knowing when to use each requires reading documentation carefully. 2. Refs are ephemeral and change after every interaction, requiring constant re-snapshotting. 3. X-SQL has strict syntax rules (single quotes for CSS, no CTEs/JOINs) that produce opaque errors when violated. 4. DOM_FIRST_HREF vs DOM_FIRST_ATTR — unclear when to use which.
+
+**Most Valuable Improvements:** 1. Fix crawl performance (146s → <10s for localhost). 2. Make click reliably trigger JS form handlers without navigating to about:blank. 3. Add runtime warnings when htmlsnapshot may return stale data. 4. Add X-SQL examples to --help output. 5. Improve timeout error messages with actionable diagnostics.
+
+**Usability Rating:** 6/10
+
+---
+
+## How to Reproduce
+
+### Common Setup
+
+1. Clone the repository and `cd` to the repo root.
+2. The CLI is invoked via `./b4w.ps1` (PowerShell) or `./b4w.sh` (Bash / Git Bash), which auto-build from source when needed.
+3. The backend server starts automatically in dev mode.
+4. All commands from repo root:
+
+   - **PowerShell:** `./b4w.ps1 <command>`
+   - **Bash / Git Bash:** `./b4w.sh <command>`
+   - **Direct:** `browser4-cli <command>` (if installed globally)
+
+   > **Note:** `$(./b4w.ps1)` is command substitution in bash — do NOT use it.
+
+### Per-Issue Reproduction Steps
+
+#### Issue 1: Click on form submit button navigates to about:blank instead of submitting via JS
+
+./b4w.ps1 goto "http://localhost:18080/generated/form-filling.html"
+Fill required fields, then: ./b4w.ps1 click e5814 (or click on #submit-btn)
+First attempt times out at 30s; second attempt shows page navigated to about:blank.
+
+#### Issue 2: Crawl is extremely slow even for localhost pages (146s for 5 pages)
+
+./b4w.ps1 crawl --seed-file seeds.txt --depth 0 --sql @query.sql --format table --refresh
+with 5 localhost URLs. Observe the progress output showing 136s before the first page completes.
+
+#### Issue 3: Crawl X-SQL extraction is inconsistent — 2/5 pages returned empty results that work fine when queried directly
+
+Create a seed file with 5 product detail URLs, run crawl with X-SQL extraction using #productTitle and #product-price selectors.
+3 of 5 pages return correct data; 2 pages (B0E000004, B0E000005) return empty title and price.
+Querying those same pages directly with htmlsnapshot + htmlsnapshot get text works correctly.
+
+#### Issue 4: HTML snapshot captures initial server HTML, not live DOM — leads to stale data silently
+
+After submitting the form on form-filling.html, run:
+./b4w.ps1 htmlsnapshot
+then:
+./b4w.ps1 htmlsnapshot get text "#result-data"
+Returns "No submission yet." even though the form was just submitted.
+
+#### Issue 5: DOM_FIRST_HREF returns empty string while DOM_FIRST_ATTR works correctly
+
+Use this X-SQL query:
+SELECT DOM_FIRST_HREF(DOM, '.product-link') AS detail_url
+FROM DOM_LOAD_AND_SELECT(@url, '.product-card')
+All detail_url values are empty strings.
+
+#### Issue 6: No inline examples in --help for htmlsnapshot query X-SQL usage
+
+Run: ./b4w.ps1 htmlsnapshot query --help
+Observe the help output — it doesn't include a copy-paste X-SQL example.
+
+#### Issue 7: First form submission attempt timed out at 30s with no useful error information
+
+Fill the form-filling.html form fields, then:
+./b4w.ps1 click e5814
+(timeout: 30s)
+Command times out and is moved to background.
+
+#### Issue 8: go-back fails silently when current page is about:blank
+
+After a click causes navigation to about:blank:
+./b4w.ps1 go-back
+Output shows page URL is still about:blank with no error message.
+

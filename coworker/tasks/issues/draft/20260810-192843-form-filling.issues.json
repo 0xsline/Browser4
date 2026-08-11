@@ -1,0 +1,262 @@
+{
+  "meta": {
+    "date": "20260810-192843",
+    "scenario": "form-filling",
+    "mode": "dev",
+    "source": "20260810-192843-form-filling.full.md"
+  },
+  "background": {
+    "executionContext": "| Step | Command | Outcome |\n|------|---------|---------|\n| 1 | `./b4w.ps1 goto \"http://localhost:18080/generated/form-filling.html\"` | Page loaded successfully |\n| 2 | `./b4w.ps1 snapshot -i --stdout` | Discovered all form fields and their refs |\n| 3a | `./b4w.ps1 fill e7417 \"Alice\"` | First Name filled |\n| 3b | `./b4w.ps1 fill e7418 \"Johnson\"` | Last Name filled |\n| 3c | `./b4w.ps1 fill e7419 \"alice.johnson@example.com\"` | Email filled |\n| 3d | `./b4w.ps1 fill e7424 \"I'd like to automate...\"` | Comments filled |\n| 4a | `./b4w.ps1 select e7420 \"United States\"` | Country selected |\n| 4b | `./b4w.ps1 select e7423 \"Advanced\"` | Experience level selected |\n| 5a-c | `./b4w.ps1 check e7429`, `e7430`, `e7432` | Three checkboxes checked |\n| 6 | `./b4w.ps1 click e7584` | Form submitted |\n| 7 | Auto (same-page form, no navigation) | Page already loaded |\n| 8a | `./b4w.ps1 get text \".result-panel\"` | Failed — CSS selectors don't work with `get` |\n| 8b | `./b4w.ps1 eval --json \"document.querySelector('#result-data')...\"` | Succeeded — extracted full payload |\n| 9 | `./b4w.ps1 snapshot -v 0 --stdout` | Full-viewport snapshot captured |\n\n**Workarounds required:**\n- Had to discover that `get text` uses accessibility-tree refs (not CSS selectors) — the error message explained this\n- Had to guess DOM IDs (`#result-data`) since accessibility labels from snapshot don't map to CSS selectors\n\n---\n\n## Issues Found\n\n```json\n{\n  \"issues\": [\n    {\n      \"title\": \"get text with CSS selectors silently fails on live page\",\n      \"severity\": \"Medium\",\n      \"category\": \"UX\",\n      \"reproduction\": \"After form submission: ./b4w.ps1 get text \\\".result-panel\\\"\",\n      \"expected\": \"The command should extract text from the matching element, or give a clear error that explains how to do it correctly.\",\n      \"actual\": \"Output: 'null' then 'No elements matched \\\".result-panel\\\".' with a tip about using htmlsnapshot instead. The tip is helpful but the initial 'null' output is confusing and the naming collision between 'get' (live AX-tree) and 'htmlsnapshot get' (stored CSS) creates cognitive overhead.\",\n      \"rootCause\": \"The 'get' command operates on the live accessibility tree using refs (e5), not CSS selectors. CSS selectors are only supported in 'htmlsnapshot get'. The naming collision between these two 'get' commands causes confusion — users naturally try CSS selectors with 'get' first since that's the pattern they learn from 'htmlsnapshot get'.\",\n      \"codePointer\": \"cli/browser4-cli/src/commands/get.rs — the get command handler\",\n      \"suggestion\": \"- Rename 'get' to 'inspect' or 'ax-get' to distinguish it from 'htmlsnapshot get'\\n- Or add CSS selector support to 'get' by first trying ref matching, then falling back to CSS selector lookup against the live DOM\\n- At minimum, detect when the selector looks like a CSS selector (starts with . # [ or contains space/>) and immediately suggest the correct alternative before the confusing 'null' output\"\n    },\n    {\n      \"title\": \"Accessibility tree labels don't map to DOM CSS selectors\",\n      \"severity\": \"Medium\",\n      \"category\": \"Discoverability\",\n      \"reproduction\": \"1. snapshot -i shows 'result-panel' and 'state-log' as generic element labels\\n2. eval 'document.querySelector(\\\".result-panel\\\")' returns null\\n3. eval 'document.querySelector(\\\".state-log\\\")' returns null\",\n      \"expected\": \"There should be a straightforward way to bridge from snapshot-discovered elements to DOM selectors usable in eval/htmlsnapshot. The snapshot shows accessibility labels (which may be aria labels, text content, or computed names) but these don't correspond to CSS classes or IDs.\",\n      \"actual\": \"Had to guess ID selectors (#result-data) through trial and error. The snapshot showed 'result-panel' and 'state-log' as accessibility labels but these don't exist as CSS classes in the DOM. Users must inspect the raw HTML or guess DOM structure.\",\n      \"rootCause\": \"The accessibility tree labels (shown in snapshot YAML as the element name after the role) come from the computed accessible name, which may be derived from aria-label, text content, title attribute, or other sources — not from CSS class names. There is no command that shows the mapping between snapshot refs and their CSS class/ID attributes.\",\n      \"codePointer\": \"\",\n      \"suggestion\": \"- Add a 'snapshot inspect <ref>' command that shows the element's tag, classes, ID, and other CSS-addressable attributes for a given ref\\n- Include CSS class and ID information in snapshot output for interactive elements (e.g., 'textbox \\\"Email\\\" [ref=e7419] [class=email-field] [id=email]')\\n- The 'generate-locator' command exists but is undocumented in the main help output and requires a separate invocation per element\"\n    },\n    {\n      \"title\": \"htmlsnapshot stale after any JS interaction — no live-DOM extraction alternative for CSS workflows\",\n      \"severity\": \"High\",\n      \"category\": \"Product\",\n      \"reproduction\": \"1. goto form page\\n2. Fill form fields, check checkboxes, submit\\n3. htmlsnapshot get text \\\".result-panel\\\" — returns stale initial HTML, not the submission result\",\n      \"expected\": \"There should be a way to extract content via CSS selectors from the live DOM, or htmlsnapshot should be re-capturable after interactions to reflect the current page state.\",\n      \"actual\": \"The docs warn that htmlsnapshot captures initial HTML only. After interactions, users must switch to 'eval' with raw JavaScript — a completely different extraction paradigm. This breaks the mental model for CSS-selector-based extraction workflows.\",\n      \"rootCause\": \"htmlsnapshot capture takes a static HTML snapshot at page load time. There is no 'htmlsnapshot recapture' command to refresh the stored snapshot from the current live DOM. Users must use eval (JavaScript) for post-interaction extraction, which requires different skills and selector knowledge.\",\n      \"codePointer\": \"browser4-rest/ — MCPToolController or htmlsnapshot capture handler\",\n      \"suggestion\": \"- Add 'htmlsnapshot recapture' command to re-capture the current live DOM into the snapshot store\\n- Or make 'htmlsnapshot get' optionally query the live DOM when passed a --live flag\\n- This is a critical gap for the common workflow of: interact with page → verify results\"\n    },\n    {\n      \"title\": \"No --submit flag on click command for form submission via Enter key\",\n      \"severity\": \"Low\",\n      \"category\": \"UX\",\n      \"reproduction\": \"Task asked to 'Press Enter or click the submit button.' The fill command has --submit but click does not. To press Enter on a submit button requires a separate 'press Enter' command.\",\n      \"expected\": \"Either click should have a --submit flag (like fill does), or the documentation should clearly show the press-Enter-to-submit pattern.\",\n      \"actual\": \"Had to use 'click e7584' which works but doesn't test the Enter-key submission path. The fill --submit pattern is only documented for text fields, not for buttons.\",\n      \"rootCause\": \"The --submit flag is specific to the fill command (it presses Enter after filling). There's no equivalent for click, even though pressing Enter on a focused submit button is a standard web interaction pattern.\",\n      \"codePointer\": \"cli/browser4-cli/src/commands/click.rs or the click command handler\",\n      \"suggestion\": \"- Add a dedicated 'submit <ref>' command that focuses the element and presses Enter\\n- Or allow 'click <ref> --submit' to press Enter instead of clicking\\n- At minimum, document the 'click <ref> then press Enter' pattern in the form-filling quick-start\"\n    },\n    {\n      \"title\": \"Hidden dynamic fields appear in snapshot with refs but cannot be interacted with\",\n      \"severity\": \"Low\",\n      \"category\": \"UX\",\n      \"reproduction\": \"snapshot -i shows phone-number (e7421) and company (e7422) textboxes with refs even when they're hidden (contact method is email). Attempting to fill them would likely fail or silently do nothing.\",\n      \"expected\": \"Hidden/invisible elements should be marked in the snapshot (e.g., [hidden]) so users don't waste time trying to interact with them, or the interactive snapshot (-i) should filter them out.\",\n      \"actual\": \"The snapshot shows these fields with valid-looking refs and no indication they're hidden. Users might try to fill them and get confused by failures or silent no-ops.\",\n      \"rootCause\": \"The accessibility tree includes elements that are in the DOM but not visible (e.g., display:none wrappers). The -i flag filters by interactive role but doesn't check visibility.\",\n      \"codePointer\": \"browser4-core/browser4-browser/ — snapshot/AX tree building logic\",\n      \"suggestion\": \"- Add visibility information to snapshot output for elements (e.g., [hidden] or [visible=false])\\n- Filter out non-visible elements in interactive mode (-i)\\n- Show a count of hidden interactive elements at the bottom of the snapshot\"\n    },\n    {\n      \"title\": \"generate-locator command hidden in help — useful but undiscoverable\",\n      \"severity\": \"Low\",\n      \"category\": \"Discoverability\",\n      \"reproduction\": \"The 'generate-locator' command is listed in the Core commands section but without a star marker and with minimal description. The SKILL.md mentions it in the verify-after-interaction patterns but not in the main command map.\",\n      \"expected\": \"A command that bridges snapshot refs to CSS selectors should be prominently featured in both quick-start and form workflows, since it solves the exact discoverability problem of mapping refs to selectors.\",\n      \"actual\": \"I only noticed this command when re-reading the SKILL.md carefully. It's not listed in the Quick Start section, the command map table, or the form-filling template. A new user would likely miss it entirely.\",\n      \"rootCause\": \"generate-locator is listed as a Core command in the help text but not highlighted with a star marker or included in the quick-start workflows where it would be most useful.\",\n      \"codePointer\": \"cli/browser4-cli/src/main.rs — help text generation\",\n      \"suggestion\": \"- Add generate-locator to the Quick Start section of help\\n- Include it in the interactive form fill template: 'generate-locator <ref> to get a reusable CSS selector'\\n- Add a star marker (★) to indicate it's a commonly used command\"\n    },\n    {\n      \"title\": \"Refs remain stable across simple form fills — docs overstate ephemerality\",\n      \"severity\": \"Low\",\n      \"category\": \"Documentation\",\n      \"reproduction\": \"Used ref e7417 across multiple fill operations without re-snapshotting. All fills succeeded. The docs say 'Refs are ephemeral — treat them as single-use handles' and 'Always re-snapshot after interactions.'\",\n      \"expected\": \"Either the docs should accurately describe when refs become stale (page navigations, DOM restructuring, reactive frameworks) vs when they remain valid (simple form fills on static pages), or the implementation should be documented more precisely.\",\n      \"actual\": \"Refs from the initial snapshot worked for all 4 text fills, 2 dropdown selects, and 3 checkbox operations without re-snapshotting. The blanket 'always re-snapshot' guidance adds unnecessary commands to simple workflows.\",\n      \"rootCause\": \"The documentation takes a conservative 'always re-snapshot' stance to prevent flaky failures on reactive pages (React, Vue, etc.), but this over-corrects for static pages where refs remain valid across many interactions. The guidance doesn't distinguish between page types.\",\n      \"codePointer\": \"skills/browser4-cli/SKILL.md — Ref Lifecycle section\",\n      \"suggestion\": \"- Add guidance distinguishing static vs reactive pages: 'On static pages, refs often survive simple form fills. On reactive pages (React, Vue, etc.), re-snapshot after every interaction.'\\n- Add a 'snapshot --check-ref <ref>' command to test if a ref is still valid without taking a full snapshot\\n- Document that auto-snapshot after each command provides fresh refs, so chaining commands without explicit re-snapshot is the intended workflow\"\n    }\n  ],\n  \"assessment\": {\n    \"completionStatus\": \"Successful — all 9 task steps completed. Form filled with realistic values, checkboxes checked, dropdowns selected, form submitted, and submission verified through both live DOM eval and accessibility tree snapshot.\",\n    \"successRate\": \"100% — all form interactions (fills, selects, checks, click) worked correctly on first attempt. The only friction was in the verification/extraction phase.\",\n    \"issuesFound\": 7,\n    \"majorBlockers\": \"None that prevented task completion. The main friction points were: (1) confusing 'get' vs 'htmlsnapshot get' naming collision, (2) no straightforward way to extract post-submission results via CSS selectors without guessing DOM structure, and (3) accessibility labels not mapping to CSS selectors.\",\n    \"mostConfusingAspects\": \"The biggest confusion was the split between two extraction paradigms: 'get' (live AX-tree, ref-based) vs 'htmlsnapshot get' (stored HTML, CSS-based). After form submission, when I needed to extract the result, 'htmlsnapshot get' was stale (warned in docs), 'get' didn't accept CSS selectors (only refs), and 'eval' required guessing DOM structure that differed from the accessibility labels shown in snapshots. The conceptual model doesn't provide a smooth path from 'I see this in the snapshot' to 'I can extract this programmatically'.\",\n    \"mostValuableImprovements\": \"1. Add CSS selector support or DOM class/ID display to snapshots so users can bridge from refs to selectors. 2. Add 'htmlsnapshot recapture' to refresh the stored snapshot from the live DOM after interactions. 3. Rename or better differentiate 'get' (AX-tree) from 'htmlsnapshot get' (CSS selectors). 4. Surface 'generate-locator' more prominently in quick-start and form workflows.\",\n    \"usabilityRating\": 6\n  }\n}\n```\n\n**Usability Rating: 6/10**\n\nThe core interaction loop (goto → snapshot → fill/select/check → click) works reliably and is well-documented. The CLI provides clear feedback after each command. However, the post-interaction extraction experience pulls the score down significantly: the `get`/`htmlsnapshot get` naming collision, the stale-htmlsnapshot limitation, and the gap between accessibility labels and DOM selectors create a confusing extraction surface that requires trial-and-error to navigate. For a first-time user trying to complete a realistic form workflow end-to-end, the interaction half is smooth but the verification half requires reading detailed docs and guessing DOM structure.",
+    "task": "**Task completed successfully.** All form fields were filled, dropdowns selected, checkboxes checked, and the form was submitted. The submission was verified through both the accessibility tree snapshot (showing \"Your form data was captured successfully\" and \"All validation checks passed\") and live DOM evaluation (extracting the full submission payload via `eval` with `#result-data`).\n\n**Form data submitted:**\n- First Name: Alice\n- Last Name: Johnson\n- Email: alice.johnson@example.com\n- Country: United States (us)\n- Experience Level: Advanced\n- Topics: Automation, Testing, AI agents\n- Contact Method: Email\n- Comments: \"I'd like to automate my e-commerce product data extraction workflow with X-SQL queries.\"\n- Agreed to terms: Yes\n\n**Verification:** `submitCount: 1`, `formValid: true`, event log shows `submit-success:email`, validation summary: \"All validation checks passed.\"\n\n---"
+  },
+  "issues": [
+    {
+      "number": 1,
+      "title": "htmlsnapshot stale after any JS interaction — no live-DOM extraction alternative for CSS workflows",
+      "severity": "High",
+      "category": "Product",
+      "sections": [
+        {
+          "body": "1. goto form page\n2. Fill form fields, check checkboxes, submit\n3. htmlsnapshot get text \".result-panel\" — returns stale initial HTML, not the submission result",
+          "label": "Reproduction"
+        },
+        {
+          "body": "There should be a way to extract content via CSS selectors from the live DOM, or htmlsnapshot should be re-capturable after interactions to reflect the current page state.",
+          "label": "Expected Behavior"
+        },
+        {
+          "body": "The docs warn that htmlsnapshot captures initial HTML only. After interactions, users must switch to 'eval' with raw JavaScript — a completely different extraction paradigm. This breaks the mental model for CSS-selector-based extraction workflows.",
+          "label": "Actual Behavior"
+        },
+        {
+          "body": "htmlsnapshot capture takes a static HTML snapshot at page load time. There is no 'htmlsnapshot recapture' command to refresh the stored snapshot from the current live DOM. Users must use eval (JavaScript) for post-interaction extraction, which requires different skills and selector knowledge.",
+          "label": "Root Cause Analysis"
+        },
+        {
+          "body": "browser4-rest/ — MCPToolController or htmlsnapshot capture handler",
+          "label": "Code Pointer"
+        },
+        {
+          "body": "- Add 'htmlsnapshot recapture' command to re-capture the current live DOM into the snapshot store\n- Or make 'htmlsnapshot get' optionally query the live DOM when passed a --live flag\n- This is a critical gap for the common workflow of: interact with page → verify results",
+          "label": "AI Suggested Improvement"
+        }
+      ],
+      "review": {
+        "decision": null,
+        "notes": ""
+      }
+    },
+    {
+      "number": 2,
+      "title": "get text with CSS selectors silently fails on live page",
+      "severity": "Medium",
+      "category": "UX",
+      "sections": [
+        {
+          "body": "After form submission: ./b4w.ps1 get text \".result-panel\"",
+          "label": "Reproduction"
+        },
+        {
+          "body": "The command should extract text from the matching element, or give a clear error that explains how to do it correctly.",
+          "label": "Expected Behavior"
+        },
+        {
+          "body": "Output: 'null' then 'No elements matched \".result-panel\".' with a tip about using htmlsnapshot instead. The tip is helpful but the initial 'null' output is confusing and the naming collision between 'get' (live AX-tree) and 'htmlsnapshot get' (stored CSS) creates cognitive overhead.",
+          "label": "Actual Behavior"
+        },
+        {
+          "body": "The 'get' command operates on the live accessibility tree using refs (e5), not CSS selectors. CSS selectors are only supported in 'htmlsnapshot get'. The naming collision between these two 'get' commands causes confusion — users naturally try CSS selectors with 'get' first since that's the pattern they learn from 'htmlsnapshot get'.",
+          "label": "Root Cause Analysis"
+        },
+        {
+          "body": "cli/browser4-cli/src/commands/get.rs — the get command handler",
+          "label": "Code Pointer"
+        },
+        {
+          "body": "- Rename 'get' to 'inspect' or 'ax-get' to distinguish it from 'htmlsnapshot get'\n- Or add CSS selector support to 'get' by first trying ref matching, then falling back to CSS selector lookup against the live DOM\n- At minimum, detect when the selector looks like a CSS selector (starts with . # [ or contains space/>) and immediately suggest the correct alternative before the confusing 'null' output",
+          "label": "AI Suggested Improvement"
+        }
+      ],
+      "review": {
+        "decision": null,
+        "notes": ""
+      }
+    },
+    {
+      "number": 3,
+      "title": "Accessibility tree labels don't map to DOM CSS selectors",
+      "severity": "Medium",
+      "category": "Discoverability",
+      "sections": [
+        {
+          "body": "1. snapshot -i shows 'result-panel' and 'state-log' as generic element labels\n2. eval 'document.querySelector(\".result-panel\")' returns null\n3. eval 'document.querySelector(\".state-log\")' returns null",
+          "label": "Reproduction"
+        },
+        {
+          "body": "There should be a straightforward way to bridge from snapshot-discovered elements to DOM selectors usable in eval/htmlsnapshot. The snapshot shows accessibility labels (which may be aria labels, text content, or computed names) but these don't correspond to CSS classes or IDs.",
+          "label": "Expected Behavior"
+        },
+        {
+          "body": "Had to guess ID selectors (#result-data) through trial and error. The snapshot showed 'result-panel' and 'state-log' as accessibility labels but these don't exist as CSS classes in the DOM. Users must inspect the raw HTML or guess DOM structure.",
+          "label": "Actual Behavior"
+        },
+        {
+          "body": "The accessibility tree labels (shown in snapshot YAML as the element name after the role) come from the computed accessible name, which may be derived from aria-label, text content, title attribute, or other sources — not from CSS class names. There is no command that shows the mapping between snapshot refs and their CSS class/ID attributes.",
+          "label": "Root Cause Analysis"
+        },
+        {
+          "body": "- Add a 'snapshot inspect <ref>' command that shows the element's tag, classes, ID, and other CSS-addressable attributes for a given ref\n- Include CSS class and ID information in snapshot output for interactive elements (e.g., 'textbox \"Email\" [ref=e7419] [class=email-field] [id=email]')\n- The 'generate-locator' command exists but is undocumented in the main help output and requires a separate invocation per element",
+          "label": "AI Suggested Improvement"
+        }
+      ],
+      "review": {
+        "decision": null,
+        "notes": ""
+      }
+    },
+    {
+      "number": 4,
+      "title": "No --submit flag on click command for form submission via Enter key",
+      "severity": "Low",
+      "category": "UX",
+      "sections": [
+        {
+          "body": "Task asked to 'Press Enter or click the submit button.' The fill command has --submit but click does not. To press Enter on a submit button requires a separate 'press Enter' command.",
+          "label": "Reproduction"
+        },
+        {
+          "body": "Either click should have a --submit flag (like fill does), or the documentation should clearly show the press-Enter-to-submit pattern.",
+          "label": "Expected Behavior"
+        },
+        {
+          "body": "Had to use 'click e7584' which works but doesn't test the Enter-key submission path. The fill --submit pattern is only documented for text fields, not for buttons.",
+          "label": "Actual Behavior"
+        },
+        {
+          "body": "The --submit flag is specific to the fill command (it presses Enter after filling). There's no equivalent for click, even though pressing Enter on a focused submit button is a standard web interaction pattern.",
+          "label": "Root Cause Analysis"
+        },
+        {
+          "body": "cli/browser4-cli/src/commands/click.rs or the click command handler",
+          "label": "Code Pointer"
+        },
+        {
+          "body": "- Add a dedicated 'submit <ref>' command that focuses the element and presses Enter\n- Or allow 'click <ref> --submit' to press Enter instead of clicking\n- At minimum, document the 'click <ref> then press Enter' pattern in the form-filling quick-start",
+          "label": "AI Suggested Improvement"
+        }
+      ],
+      "review": {
+        "decision": null,
+        "notes": ""
+      }
+    },
+    {
+      "number": 5,
+      "title": "Hidden dynamic fields appear in snapshot with refs but cannot be interacted with",
+      "severity": "Low",
+      "category": "UX",
+      "sections": [
+        {
+          "body": "snapshot -i shows phone-number (e7421) and company (e7422) textboxes with refs even when they're hidden (contact method is email). Attempting to fill them would likely fail or silently do nothing.",
+          "label": "Reproduction"
+        },
+        {
+          "body": "Hidden/invisible elements should be marked in the snapshot (e.g., [hidden]) so users don't waste time trying to interact with them, or the interactive snapshot (-i) should filter them out.",
+          "label": "Expected Behavior"
+        },
+        {
+          "body": "The snapshot shows these fields with valid-looking refs and no indication they're hidden. Users might try to fill them and get confused by failures or silent no-ops.",
+          "label": "Actual Behavior"
+        },
+        {
+          "body": "The accessibility tree includes elements that are in the DOM but not visible (e.g., display:none wrappers). The -i flag filters by interactive role but doesn't check visibility.",
+          "label": "Root Cause Analysis"
+        },
+        {
+          "body": "browser4-core/browser4-browser/ — snapshot/AX tree building logic",
+          "label": "Code Pointer"
+        },
+        {
+          "body": "- Add visibility information to snapshot output for elements (e.g., [hidden] or [visible=false])\n- Filter out non-visible elements in interactive mode (-i)\n- Show a count of hidden interactive elements at the bottom of the snapshot",
+          "label": "AI Suggested Improvement"
+        }
+      ],
+      "review": {
+        "decision": null,
+        "notes": ""
+      }
+    },
+    {
+      "number": 6,
+      "title": "generate-locator command hidden in help — useful but undiscoverable",
+      "severity": "Low",
+      "category": "Discoverability",
+      "sections": [
+        {
+          "body": "The 'generate-locator' command is listed in the Core commands section but without a star marker and with minimal description. The SKILL.md mentions it in the verify-after-interaction patterns but not in the main command map.",
+          "label": "Reproduction"
+        },
+        {
+          "body": "A command that bridges snapshot refs to CSS selectors should be prominently featured in both quick-start and form workflows, since it solves the exact discoverability problem of mapping refs to selectors.",
+          "label": "Expected Behavior"
+        },
+        {
+          "body": "I only noticed this command when re-reading the SKILL.md carefully. It's not listed in the Quick Start section, the command map table, or the form-filling template. A new user would likely miss it entirely.",
+          "label": "Actual Behavior"
+        },
+        {
+          "body": "generate-locator is listed as a Core command in the help text but not highlighted with a star marker or included in the quick-start workflows where it would be most useful.",
+          "label": "Root Cause Analysis"
+        },
+        {
+          "body": "cli/browser4-cli/src/main.rs — help text generation",
+          "label": "Code Pointer"
+        },
+        {
+          "body": "- Add generate-locator to the Quick Start section of help\n- Include it in the interactive form fill template: 'generate-locator <ref> to get a reusable CSS selector'\n- Add a star marker (★) to indicate it's a commonly used command",
+          "label": "AI Suggested Improvement"
+        }
+      ],
+      "review": {
+        "decision": null,
+        "notes": ""
+      }
+    },
+    {
+      "number": 7,
+      "title": "Refs remain stable across simple form fills — docs overstate ephemerality",
+      "severity": "Low",
+      "category": "Documentation",
+      "sections": [
+        {
+          "body": "Used ref e7417 across multiple fill operations without re-snapshotting. All fills succeeded. The docs say 'Refs are ephemeral — treat them as single-use handles' and 'Always re-snapshot after interactions.'",
+          "label": "Reproduction"
+        },
+        {
+          "body": "Either the docs should accurately describe when refs become stale (page navigations, DOM restructuring, reactive frameworks) vs when they remain valid (simple form fills on static pages), or the implementation should be documented more precisely.",
+          "label": "Expected Behavior"
+        },
+        {
+          "body": "Refs from the initial snapshot worked for all 4 text fills, 2 dropdown selects, and 3 checkbox operations without re-snapshotting. The blanket 'always re-snapshot' guidance adds unnecessary commands to simple workflows.",
+          "label": "Actual Behavior"
+        },
+        {
+          "body": "The documentation takes a conservative 'always re-snapshot' stance to prevent flaky failures on reactive pages (React, Vue, etc.), but this over-corrects for static pages where refs remain valid across many interactions. The guidance doesn't distinguish between page types.",
+          "label": "Root Cause Analysis"
+        },
+        {
+          "body": "skills/browser4-cli/SKILL.md — Ref Lifecycle section",
+          "label": "Code Pointer"
+        },
+        {
+          "body": "- Add guidance distinguishing static vs reactive pages: 'On static pages, refs often survive simple form fills. On reactive pages (React, Vue, etc.), re-snapshot after every interaction.'\n- Add a 'snapshot --check-ref <ref>' command to test if a ref is still valid without taking a full snapshot\n- Document that auto-snapshot after each command provides fresh refs, so chaining commands without explicit re-snapshot is the intended workflow",
+          "label": "AI Suggested Improvement"
+        }
+      ],
+      "review": {
+        "decision": null,
+        "notes": ""
+      }
+    }
+  ]
+}

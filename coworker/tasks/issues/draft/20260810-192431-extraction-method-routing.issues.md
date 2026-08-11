@@ -1,0 +1,629 @@
+# Issues: extraction-method-routing
+
+> **Source:** `20260810-192431-extraction-method-routing.full.md` | **Date:** 20260810-192431 | **Mode:** dev
+
+## Scenario Background
+
+### Task
+
+**Partially Successful.** All 7 acceptance criteria were exercised, covering every branch of SKILL.md §4a:
+
+| AC | Branch | Status | Method Used | Result |
+|---|---|---|---|---|
+| AC1 | Interact first, then extract | ⚠️ Partial | `eval --json` (not `htmlsnapshot get text`) | Confirmation + payload extracted; `htmlsnapshot` failed for JS-modified DOM |
+| AC2 | Static page, one field | ✓ | `htmlsnapshot get text "#productTitle"` | "4K OLED TV 55" |
+| AC3 | Static page, one field, all matches | ✓ | `htmlsnapshot get all text '[class*="product-title"]'` | 6 product titles |
+| AC4 | Static page, correlated multi-field | ✓ | `htmlsnapshot query --sql` (X-SQL) | 6 rows: source_url, title, price, detail_link |
+| AC5 | Dynamic/complex, live DOM | ✓ | `eval --json` | Structured object: title, button/link/form counts, headings |
+| AC6 | Natural language extraction | ✓ | `extract` | Product title, price $199.99, rating 4.4, features (2/3 bullets) |
+| AC7 | High-volume, crawl + seed file | ⚠️ Partial | `crawl --seed-file --depth 0 --sql` | 4 rows; price column initially empty, needed selector fix; 96s for 4 pages |
+
+### Execution Context
+
+**Key Commands:**
+
+1. `./b4w.ps1 help` — learned command structure
+2. `./b4w.ps1 goto "http://localhost:18080/generated/form-filling.html"` — AC1 start
+3. `./b4w.ps1 snapshot -i --stdout` — got interactive refs: e4890 (First Name), e4897 (Last Name), e4904 (Email), e4911 (Country), e4957 (Testing), e4947 (Phone radio), e5013 (Agree terms), e5018 (Submit)
+4. Filled fields: `fill e4890 "Jane"`, `fill e4897 "Smith"`, `fill e4904 "jane@example.com"`, `select e4911 "Singapore"`, `check e4957`, `check e4947`, `check e5013`
+5. `click e5018` — first submit **failed** (phone number required for phone contact method)
+6. `fill e4963 "+65 9123 4567"` then `click e5018` — **succeeded**
+7. `htmlsnapshot capture` + `get text ".result-panel"` — **failed** (stale HTML, JS-injected content not captured)
+8. `get text ".result-panel"` — **failed** (returned null from accessibility tree)
+9. `eval --json 'JSON.stringify({confirmation:..., payload:..., validation:...})'` — **succeeded**, confirmed values
+10. `goto .../ec/dp/B0E000001` + `htmlsnapshot capture` + `get text "#productTitle"` → AC2 ✓
+11. `goto .../ec/b?node=1292115012` + `htmlsnapshot capture` + `get all text '[class*="product-title"]'` → AC3 ✓
+12. `htmlsnapshot query "http://..." --sql @ac4-query.sql` → AC4 ✓ (6 correlated rows)
+13. `goto .../interactive-1.html` + `eval --json '...'` → AC5 ✓
+14. `goto .../ec/dp/B0E000002` + `extract 'Return product title...'` → AC6 ✓ (file output)
+15. `crawl --seed-file ... --depth 0 --sql @... --format table --refresh` → AC7: 4 rows but prices empty
+16. `htmlsnapshot inspect` + `eval` — discovered `.price-row` not `.product-price`
+17. Fixed query, re-ran crawl — 4 rows with correct data, **96s for 4 pages**
+
+**Key workarounds:** (1) Used `eval` instead of `htmlsnapshot` for post-interaction extraction, (2) Discovered `.price-row` selector through trial-and-error because detail page uses different CSS classes than listing page.
+
+---
+
+```json
+{
+  "issues": [
+    {
+      "title": "htmlsnapshot cannot extract JS-modified content after page interaction",
+      "severity": "High",
+      "category": "Product",
+      "reproduction": "1. Go to form-filling page\n2. Fill and submit the form\n3. Run `htmlsnapshot capture` then `htmlsnapshot get text \".result-panel\"`\n4. Observe \"No elements matched\" error even though the result panel is visible in the accessibility tree",
+      "expected": "htmlsnapshot should be able to capture and extract from the current page DOM state, including content added by JavaScript after page load.",
+      "actual": "htmlsnapshot only captures the initial server-rendered HTML. After form submission (or any JS DOM mutation), the stored snapshot is stale and returns \"No elements matched\" for dynamically-added elements. The error message suggests re-capturing, but re-capture also only stores initial HTML.",
+      "rootCause": "htmlsnapshot stores the initial page HTML fetched at load time, not the live DOM. It does not re-fetch or serialize the current DOM state. This is correctly documented as a warning in SKILL.md, but contradicts the natural user expectation that capturing a snapshot after interaction should reflect the current page state.",
+      "codePointer": "browser4-rest/src/main/kotlin/... MCPToolController.kt or the htmlsnapshot storage layer — the snapshot capture should optionally serialize the live DOM rather than only storing the initial fetch HTML.",
+      "suggestion": "- Add a `--live` flag to `htmlsnapshot capture` that serializes the current live DOM via CDP (e.g. `DOM.getOuterHTML` on `document.documentElement`) instead of using the initially-fetched HTML\n- Update the \"No HTML snapshot found\" / \"stale snapshot\" error message to clearly explain this limitation and suggest `eval --json` as the workaround for JS-modified pages\n- Consider making live-DOM capture the default behavior, with `--initial` for the current initial-HTML behavior"
+    },
+    {
+      "title": "get text command returns unhelpful redirect loop error for JS-modified content",
+      "severity": "Medium",
+      "category": "UX",
+      "reproduction": "1. Submit a form that modifies the DOM via JS\n2. Run `get text \".result-panel\"`\n3. Observe error: \"use htmlsnapshot get text\" as suggested workaround",
+      "expected": "The error should suggest `eval` for live-DOM access when the element is JS-generated.",
+      "actual": "The error says: 'The `get` command queries the live page through the accessibility tree — CSS selectors from htmlsnapshot may not apply here. For CSS selector-based extraction, capture the DOM first with `htmlsnapshot`, then use `htmlsnapshot get text \".result-panel\"`.' This creates a loop: `get text` fails → suggests `htmlsnapshot get text` → also fails → suggests re-capture → continues to fail.",
+      "rootCause": "The error message in `get text` assumes the user should use `htmlsnapshot` for CSS extraction, but doesn't account for the case where the element doesn't exist in the initial HTML at all (JS-injected). The error logic doesn't distinguish between 'selector doesn't match in accessibility tree' and 'element was added by JS after page load'.",
+      "codePointer": "cli/browser4-cli/src/ — the get text command handler or the error formatting for the get command result.",
+      "suggestion": "- If `get text` returns zero matches and `htmlsnapshot` was previously captured, check if the selector matches in htmlsnapshot; if not, suggest `eval` as the primary workaround for JS-generated content\n- Change the error text to: \"No elements matched. If this content was added by JavaScript after page load, use `eval --json 'JSON.stringify(document.querySelector(\\\"...\\\")?.innerText)'` for live-DOM access.\""
+    },
+    {
+      "title": "Crawl --depth 0 is excessively slow for seed-file bulk extraction",
+      "severity": "Medium",
+      "category": "Reliability",
+      "reproduction": "Run `crawl --seed-file urls.txt --depth 0 --sql @query.sql --format table --refresh` with 4 localhost URLs. Observe ~96s total time with ~90s of \"waiting for first page\" before any progress.",
+      "expected": "For 4 static localhost pages, the crawl should complete in under 20 seconds total, with progressive output as each page is processed.",
+      "actual": "96 seconds total for 4 pages (~24s/page). First 90+ seconds show only \"waiting for first page\" with no indication of what's happening. Users might kill the process thinking it's hung.",
+      "rootCause": "The crawl queue processing appears to have high per-page overhead (browser context creation, page load timeout, X-SQL execution serialization). The \"waiting for first page\" phase with no progress indicators suggests either a cold-start warmup or a sequential queue drain that doesn't report until the first result arrives. Investigation needed: is this a thread-pool startup delay, a per-fetch timeout setting, or a serialization bottleneck?",
+      "codePointer": "browser4-rest crawl task processing — the crawl queue consumer, page fetch timeout defaults, or the polling interval for crawl status updates may be the bottleneck.",
+      "suggestion": "- Show progressive feedback during the \"first page\" phase: \"Starting browser contexts...\", \"Fetching page 1/4...\"\n- For `--depth 0` (no link discovery), process pages concurrently (up to N parallel fetches) instead of sequentially\n- Reduce default page-load timeout for localhost or `--depth 0` seed-file mode\n- Consider a fast-path: for `--depth 0`, use the scrape API directly without full browser contexts"
+    },
+    {
+      "title": "extract command output format is file-based and less ergonomic than eval --json",
+      "severity": "Low",
+      "category": "UX",
+      "reproduction": "Run `extract 'Return product title, price, rating as JSON.'`. The output says: '[Extracted content](/path/to/extract-....txt)' pointing to a file.",
+      "expected": "Output should be available on stdout in a parseable format (JSON), similar to `eval --json` and `htmlsnapshot query`.",
+      "actual": "The result is written to a file. Reading the file shows a JSON wrapper where the actual extracted data is embedded as an escaped JSON string inside a `description` field. This requires two levels of parsing (parse outer JSON → parse inner JSON string → use data).",
+      "rootCause": "The extract command likely uses an agent/LLM path that returns a structured ExtractResult object, serialized to a file. The CLI doesn't parse this into a direct stdout format.",
+      "codePointer": "browser4-agentic/ — ExtractResult serialization and CLI rendering for the extract command.",
+      "suggestion": "- Add `--json` flag to `extract` that outputs the parsed extraction on stdout as clean JSON (similar to `eval --json`)\n- If `description` is consistently valid JSON, auto-parse and flatten it for stdout display\n- Consider adding `--stdout` flag to print extracted content directly rather than saving to file"
+    },
+    {
+      "title": "Crawl progress UX lacks detail during long 'waiting for first page' phase",
+      "severity": "Medium",
+      "category": "UX",
+      "reproduction": "Run a crawl with any seed file. Observe repeated 'Crawling... waiting for first page (Xs elapsed, N URLs queued)' messages with no indication of what work is happening.",
+      "expected": "Progress should indicate what phase the crawl is in: initializing browser, fetching URL 1/N, executing X-SQL, etc.",
+      "actual": "The same generic message repeats for 90+ seconds with only a counter incrementing. Users have no way to know if the crawl is progressing, stuck, or failing silently.",
+      "rootCause": "The crawl progress reporting only polls the task status at intervals, showing 'waiting for first page' until at least one page completes. It doesn't expose intermediate states (browser startup, page fetch in progress, X-SQL processing).",
+      "codePointer": "cli/browser4-cli/src/ — the crawl status polling loop that renders progress messages.",
+      "suggestion": "- Report per-URL progress on the server side: 'fetching', 'executing SQL', 'done', 'failed'\n- The CLI polling loop should map these states to meaningful messages: 'Opening browser for page 1/4...', 'Executing X-SQL on page 1/4...', '1/4 complete'\n- Add a spinner or elapsed time indicator to show the command hasn't hung\n- For `--depth 0`, estimate total time based on per-page average once the first page completes"
+    },
+    {
+      "title": "Inconsistent CSS class naming between listing and product detail pages on MockSite",
+      "severity": "Low",
+      "category": "Product",
+      "reproduction": "On listing page: `.product-price` exists for each product card. On detail page: price uses `.price-row` not `.product-price`. A crawl query using `.product-price` returns empty prices on detail pages.",
+      "expected": "Product detail pages should use consistent CSS class names with listing pages for the same data fields (price, title, etc.).",
+      "actual": "Listing uses `.product-price`; detail uses `.price-row`. Users must discover this via `htmlsnapshot inspect` or `eval` by trial and error.",
+      "rootCause": "MockSite fixture HTML has inconsistent class naming between the two page types. While this is a fixture issue rather than a browser4-cli bug, it surfaces a real problem: in production, different page types on the same site often use different selectors, and browser4-cli offers no way to handle per-URL selector mapping in a single crawl query.",
+      "codePointer": "MockSite HTML fixtures in browser4-tests/pulsar-tests-common/src/main/resources/static/b4/ — product detail page template should use `.product-price` for consistency.",
+      "suggestion": "- Fix MockSite fixtures: use `.product-price` on both listing and detail pages\n- For production use, consider adding a selector-fallback feature in X-SQL: `DOM_FIRST_TEXT(DOM, '.product-price, .price-row, [class*=\"price\"]')` to try multiple selectors\n- Document common selector discovery patterns in SKILL.md: always run `htmlsnapshot inspect` on the target page type before writing X-SQL queries"
+    },
+    {
+      "title": "htmlsnapshot inspect auto-discovers wrong repeating pattern on product detail pages",
+      "severity": "Low",
+      "category": "Reliability",
+      "reproduction": "On `/ec/dp/B0E000001`, run `htmlsnapshot capture` then `htmlsnapshot inspect`. The tool auto-discovers `.recommendation-card` (the 'Customers also viewed' section) as the repeating pattern instead of the primary product info section.",
+      "expected": "inspect should either surface the primary page content pattern (`#product-page`) or show multiple candidate patterns ranked by prominence.",
+      "actual": "inspect auto-selected `.recommendation-card` (4 recommendation items) as THE repeating pattern, completely ignoring the primary product section. The product title, price, and features aren't flagged as extractable patterns.",
+      "rootCause": "The inspect algorithm appears to pick the first/most numerous repeating pattern it finds. On product detail pages, the recommendation cards (4 identical sibling articles) form a more obvious repeating pattern than the single product info section. The algorithm doesn't consider semantic priority or page structure hierarchy.",
+      "codePointer": "The htmlsnapshot inspect pattern-discovery algorithm — likely in browser4-rest's HTML snapshot analysis code.",
+      "suggestion": "- Show multiple candidate patterns when available (e.g. 'Primary section: #product-page (1 match)' and 'Repeating section: .recommendation-card (4 matches)')\n- Prioritize `#product-page`, `main`, or `[role=\"main\"]` scoped patterns over sidebar/recommendation patterns\n- Add a `--scope` flag to `htmlsnapshot inspect` to focus discovery on a specific container: `htmlsnapshot inspect --scope \"#product-page\"`"
+    },
+    {
+      "title": "First invocation latency requires patience but is well-documented",
+      "severity": "Low",
+      "category": "UX",
+      "reproduction": "Run `./b4w.ps1 goto <url>` for the first time in a session. The first command takes ~10s while JVM + Spring Boot start.",
+      "expected": "N/A — this is expected JVM startup overhead.",
+      "actual": "~10s first-command latency with spinner showing stage progress (JVM → Spring Boot → MCP tools). Subsequent commands are instant.",
+      "rootCause": "Spring Boot JVM startup time. The spinner provides stage-level feedback, which mitigates the UX impact. SKILL.md §1 documents this with a prominent note.",
+      "codePointer": "",
+      "suggestion": "- Consider adding a `browser4-cli warmup` or `browser4-cli daemon-start` command to pre-start the backend before the first real command\n- The spinner feedback is already good; consider showing an estimated time-to-ready after first initialization"
+    },
+    {
+      "title": "snapshot output is verbose by default — interactive elements hidden in noise",
+      "severity": "Low",
+      "category": "UX",
+      "reproduction": "Run `snapshot --stdout` on a moderately complex page. Output includes every generic container, div, and non-interactive element in the accessibility tree.",
+      "expected": "The default snapshot should be scannable, perhaps defaulting to interactive-only with a flag for full tree.",
+      "actual": "Default snapshot on the form page produced hundreds of lines including deeply nested containers. The `-i` flag (interactive-only) dramatically improves scannability but requires users to know about it.",
+      "rootCause": "Default snapshot verbosity is set to 'full AX tree' without viewport filtering. Interactive-only mode (`-i`) exists but is opt-in.",
+      "codePointer": "cli/browser4-cli/src/snapshot.rs — default snapshot verbosity level.",
+      "suggestion": "- Consider making `-i` (interactive only) the default for `snapshot`, with `-v 0` or `--full` to get the full tree\n- Or add a `--brief` flag as an alias for `-i` for discoverability\n- The SKILL.md does a good job explaining `-i` vs `-v 0` vs default; the issue is the CLI default, not the docs"
+    }
+  ],
+  "assessment": {
+    "completionStatus": "Partially Successful — all 7 acceptance criteria were exercised and all branches of SKILL.md §4a were covered. AC1 (interact-then-extract) required a workaround (eval instead of htmlsnapshot) because htmlsnapshot only captures initial HTML. AC7 (crawl) was slow and required selector debugging due to inconsistent CSS between page types.",
+    "successRate": "85% — 6 of 7 ACs completed without significant issues. AC1 path was broken for the documented htmlsnapshot approach but worked with eval. AC7 was functionally correct but slow and required selector workaround.",
+    "issuesFound": 9,
+    "majorBlockers": "htmlsnapshot cannot extract from JS-modified DOM — this is the primary architectural limitation and directly blocks the AC1 'interact then extract with htmlsnapshot' workflow. The docs correctly warn about this, but the task scenario is structured to require it, creating a trap for new users.",
+    "mostConfusingAspects": "1) The distinction between snapshot (accessibility tree) vs htmlsnapshot (initial HTML) vs eval (live DOM) — getting the right tool for each scenario requires reading multiple sections of docs. 2) The `get text` → htmlsnapshot error loop when extracting post-interaction content. 3) CSS selector inconsistency between MockSite page types makes X-SQL queries fragile. 4) The crawl 'waiting for first page' lockup reads as a hang.",
+    "mostValuableImprovements": "1) Live-DOM capture mode for htmlsnapshot to fix post-interaction extraction. 2) Faster crawl processing with parallel fetch and progressive output. 3) Better error messages that break the get-text/htmlsnapshot loop. 4) Cleaner extract output format (stdout JSON).",
+    "usabilityRating": 6
+  }
+}
+```
+
+---
+
+## Issues Found (9 issues)
+
+### Issue 1: htmlsnapshot cannot extract JS-modified content after page interaction
+
+**Severity:** High
+**Category:** Product
+
+#### Reproduction
+
+1. Go to form-filling page
+2. Fill and submit the form
+3. Run `htmlsnapshot capture` then `htmlsnapshot get text ".result-panel"`
+4. Observe "No elements matched" error even though the result panel is visible in the accessibility tree
+
+#### Expected Behavior
+
+htmlsnapshot should be able to capture and extract from the current page DOM state, including content added by JavaScript after page load.
+
+#### Actual Behavior
+
+htmlsnapshot only captures the initial server-rendered HTML. After form submission (or any JS DOM mutation), the stored snapshot is stale and returns "No elements matched" for dynamically-added elements. The error message suggests re-capturing, but re-capture also only stores initial HTML.
+
+#### Root Cause Analysis
+
+htmlsnapshot stores the initial page HTML fetched at load time, not the live DOM. It does not re-fetch or serialize the current DOM state. This is correctly documented as a warning in SKILL.md, but contradicts the natural user expectation that capturing a snapshot after interaction should reflect the current page state.
+
+#### Code Pointer
+
+`browser4-rest/src/main/kotlin/... MCPToolController.kt or the htmlsnapshot storage layer — the snapshot capture should optionally serialize the live DOM rather than only storing the initial fetch HTML.`
+
+#### AI Suggested Improvement
+
+- Add a `--live` flag to `htmlsnapshot capture` that serializes the current live DOM via CDP (e.g. `DOM.getOuterHTML` on `document.documentElement`) instead of using the initially-fetched HTML
+- Update the "No HTML snapshot found" / "stale snapshot" error message to clearly explain this limitation and suggest `eval --json` as the workaround for JS-modified pages
+- Consider making live-DOM capture the default behavior, with `--initial` for the current initial-HTML behavior
+
+#### Human Review
+
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
+- **Notes:**
+
+---
+
+### Issue 2: get text command returns unhelpful redirect loop error for JS-modified content
+
+**Severity:** Medium
+**Category:** UX
+
+#### Reproduction
+
+1. Submit a form that modifies the DOM via JS
+2. Run `get text ".result-panel"`
+3. Observe error: "use htmlsnapshot get text" as suggested workaround
+
+#### Expected Behavior
+
+The error should suggest `eval` for live-DOM access when the element is JS-generated.
+
+#### Actual Behavior
+
+The error says: 'The `get` command queries the live page through the accessibility tree — CSS selectors from htmlsnapshot may not apply here. For CSS selector-based extraction, capture the DOM first with `htmlsnapshot`, then use `htmlsnapshot get text ".result-panel"`.' This creates a loop: `get text` fails → suggests `htmlsnapshot get text` → also fails → suggests re-capture → continues to fail.
+
+#### Root Cause Analysis
+
+The error message in `get text` assumes the user should use `htmlsnapshot` for CSS extraction, but doesn't account for the case where the element doesn't exist in the initial HTML at all (JS-injected). The error logic doesn't distinguish between 'selector doesn't match in accessibility tree' and 'element was added by JS after page load'.
+
+#### Code Pointer
+
+`cli/browser4-cli/src/ — the get text command handler or the error formatting for the get command result.`
+
+#### AI Suggested Improvement
+
+- If `get text` returns zero matches and `htmlsnapshot` was previously captured, check if the selector matches in htmlsnapshot; if not, suggest `eval` as the primary workaround for JS-generated content
+- Change the error text to: "No elements matched. If this content was added by JavaScript after page load, use `eval --json 'JSON.stringify(document.querySelector(\"...\")?.innerText)'` for live-DOM access."
+
+#### Human Review
+
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
+- **Notes:**
+
+---
+
+### Issue 3: Crawl --depth 0 is excessively slow for seed-file bulk extraction
+
+**Severity:** Medium
+**Category:** Reliability
+
+#### Reproduction
+
+Run `crawl --seed-file urls.txt --depth 0 --sql @query.sql --format table --refresh` with 4 localhost URLs. Observe ~96s total time with ~90s of "waiting for first page" before any progress.
+
+#### Expected Behavior
+
+For 4 static localhost pages, the crawl should complete in under 20 seconds total, with progressive output as each page is processed.
+
+#### Actual Behavior
+
+96 seconds total for 4 pages (~24s/page). First 90+ seconds show only "waiting for first page" with no indication of what's happening. Users might kill the process thinking it's hung.
+
+#### Root Cause Analysis
+
+The crawl queue processing appears to have high per-page overhead (browser context creation, page load timeout, X-SQL execution serialization). The "waiting for first page" phase with no progress indicators suggests either a cold-start warmup or a sequential queue drain that doesn't report until the first result arrives. Investigation needed: is this a thread-pool startup delay, a per-fetch timeout setting, or a serialization bottleneck?
+
+#### Code Pointer
+
+`browser4-rest crawl task processing — the crawl queue consumer, page fetch timeout defaults, or the polling interval for crawl status updates may be the bottleneck.`
+
+#### AI Suggested Improvement
+
+- Show progressive feedback during the "first page" phase: "Starting browser contexts...", "Fetching page 1/4..."
+- For `--depth 0` (no link discovery), process pages concurrently (up to N parallel fetches) instead of sequentially
+- Reduce default page-load timeout for localhost or `--depth 0` seed-file mode
+- Consider a fast-path: for `--depth 0`, use the scrape API directly without full browser contexts
+
+#### Human Review
+
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
+- **Notes:**
+
+---
+
+### Issue 4: Crawl progress UX lacks detail during long 'waiting for first page' phase
+
+**Severity:** Medium
+**Category:** UX
+
+#### Reproduction
+
+Run a crawl with any seed file. Observe repeated 'Crawling... waiting for first page (Xs elapsed, N URLs queued)' messages with no indication of what work is happening.
+
+#### Expected Behavior
+
+Progress should indicate what phase the crawl is in: initializing browser, fetching URL 1/N, executing X-SQL, etc.
+
+#### Actual Behavior
+
+The same generic message repeats for 90+ seconds with only a counter incrementing. Users have no way to know if the crawl is progressing, stuck, or failing silently.
+
+#### Root Cause Analysis
+
+The crawl progress reporting only polls the task status at intervals, showing 'waiting for first page' until at least one page completes. It doesn't expose intermediate states (browser startup, page fetch in progress, X-SQL processing).
+
+#### Code Pointer
+
+`cli/browser4-cli/src/ — the crawl status polling loop that renders progress messages.`
+
+#### AI Suggested Improvement
+
+- Report per-URL progress on the server side: 'fetching', 'executing SQL', 'done', 'failed'
+- The CLI polling loop should map these states to meaningful messages: 'Opening browser for page 1/4...', 'Executing X-SQL on page 1/4...', '1/4 complete'
+- Add a spinner or elapsed time indicator to show the command hasn't hung
+- For `--depth 0`, estimate total time based on per-page average once the first page completes
+
+#### Human Review
+
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
+- **Notes:**
+
+---
+
+### Issue 5: extract command output format is file-based and less ergonomic than eval --json
+
+**Severity:** Low
+**Category:** UX
+
+#### Reproduction
+
+Run `extract 'Return product title, price, rating as JSON.'`. The output says: '[Extracted content](/path/to/extract-....txt)' pointing to a file.
+
+#### Expected Behavior
+
+Output should be available on stdout in a parseable format (JSON), similar to `eval --json` and `htmlsnapshot query`.
+
+#### Actual Behavior
+
+The result is written to a file. Reading the file shows a JSON wrapper where the actual extracted data is embedded as an escaped JSON string inside a `description` field. This requires two levels of parsing (parse outer JSON → parse inner JSON string → use data).
+
+#### Root Cause Analysis
+
+The extract command likely uses an agent/LLM path that returns a structured ExtractResult object, serialized to a file. The CLI doesn't parse this into a direct stdout format.
+
+#### Code Pointer
+
+`browser4-agentic/ — ExtractResult serialization and CLI rendering for the extract command.`
+
+#### AI Suggested Improvement
+
+- Add `--json` flag to `extract` that outputs the parsed extraction on stdout as clean JSON (similar to `eval --json`)
+- If `description` is consistently valid JSON, auto-parse and flatten it for stdout display
+- Consider adding `--stdout` flag to print extracted content directly rather than saving to file
+
+#### Human Review
+
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
+- **Notes:**
+
+---
+
+### Issue 6: Inconsistent CSS class naming between listing and product detail pages on MockSite
+
+**Severity:** Low
+**Category:** Product
+
+#### Reproduction
+
+On listing page: `.product-price` exists for each product card. On detail page: price uses `.price-row` not `.product-price`. A crawl query using `.product-price` returns empty prices on detail pages.
+
+#### Expected Behavior
+
+Product detail pages should use consistent CSS class names with listing pages for the same data fields (price, title, etc.).
+
+#### Actual Behavior
+
+Listing uses `.product-price`; detail uses `.price-row`. Users must discover this via `htmlsnapshot inspect` or `eval` by trial and error.
+
+#### Root Cause Analysis
+
+MockSite fixture HTML has inconsistent class naming between the two page types. While this is a fixture issue rather than a browser4-cli bug, it surfaces a real problem: in production, different page types on the same site often use different selectors, and browser4-cli offers no way to handle per-URL selector mapping in a single crawl query.
+
+#### Code Pointer
+
+`MockSite HTML fixtures in browser4-tests/pulsar-tests-common/src/main/resources/static/b4/ — product detail page template should use `.product-price` for consistency.`
+
+#### AI Suggested Improvement
+
+- Fix MockSite fixtures: use `.product-price` on both listing and detail pages
+- For production use, consider adding a selector-fallback feature in X-SQL: `DOM_FIRST_TEXT(DOM, '.product-price, .price-row, [class*="price"]')` to try multiple selectors
+- Document common selector discovery patterns in SKILL.md: always run `htmlsnapshot inspect` on the target page type before writing X-SQL queries
+
+#### Human Review
+
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
+- **Notes:**
+
+---
+
+### Issue 7: htmlsnapshot inspect auto-discovers wrong repeating pattern on product detail pages
+
+**Severity:** Low
+**Category:** Reliability
+
+#### Reproduction
+
+On `/ec/dp/B0E000001`, run `htmlsnapshot capture` then `htmlsnapshot inspect`. The tool auto-discovers `.recommendation-card` (the 'Customers also viewed' section) as the repeating pattern instead of the primary product info section.
+
+#### Expected Behavior
+
+inspect should either surface the primary page content pattern (`#product-page`) or show multiple candidate patterns ranked by prominence.
+
+#### Actual Behavior
+
+inspect auto-selected `.recommendation-card` (4 recommendation items) as THE repeating pattern, completely ignoring the primary product section. The product title, price, and features aren't flagged as extractable patterns.
+
+#### Root Cause Analysis
+
+The inspect algorithm appears to pick the first/most numerous repeating pattern it finds. On product detail pages, the recommendation cards (4 identical sibling articles) form a more obvious repeating pattern than the single product info section. The algorithm doesn't consider semantic priority or page structure hierarchy.
+
+#### Code Pointer
+
+`The htmlsnapshot inspect pattern-discovery algorithm — likely in browser4-rest's HTML snapshot analysis code.`
+
+#### AI Suggested Improvement
+
+- Show multiple candidate patterns when available (e.g. 'Primary section: #product-page (1 match)' and 'Repeating section: .recommendation-card (4 matches)')
+- Prioritize `#product-page`, `main`, or `[role="main"]` scoped patterns over sidebar/recommendation patterns
+- Add a `--scope` flag to `htmlsnapshot inspect` to focus discovery on a specific container: `htmlsnapshot inspect --scope "#product-page"`
+
+#### Human Review
+
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
+- **Notes:**
+
+---
+
+### Issue 8: First invocation latency requires patience but is well-documented
+
+**Severity:** Low
+**Category:** UX
+
+#### Reproduction
+
+Run `./b4w.ps1 goto <url>` for the first time in a session. The first command takes ~10s while JVM + Spring Boot start.
+
+#### Expected Behavior
+
+N/A — this is expected JVM startup overhead.
+
+#### Actual Behavior
+
+~10s first-command latency with spinner showing stage progress (JVM → Spring Boot → MCP tools). Subsequent commands are instant.
+
+#### Root Cause Analysis
+
+Spring Boot JVM startup time. The spinner provides stage-level feedback, which mitigates the UX impact. SKILL.md §1 documents this with a prominent note.
+
+#### AI Suggested Improvement
+
+- Consider adding a `browser4-cli warmup` or `browser4-cli daemon-start` command to pre-start the backend before the first real command
+- The spinner feedback is already good; consider showing an estimated time-to-ready after first initialization
+
+#### Human Review
+
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
+- **Notes:**
+
+---
+
+### Issue 9: snapshot output is verbose by default — interactive elements hidden in noise
+
+**Severity:** Low
+**Category:** UX
+
+#### Reproduction
+
+Run `snapshot --stdout` on a moderately complex page. Output includes every generic container, div, and non-interactive element in the accessibility tree.
+
+#### Expected Behavior
+
+The default snapshot should be scannable, perhaps defaulting to interactive-only with a flag for full tree.
+
+#### Actual Behavior
+
+Default snapshot on the form page produced hundreds of lines including deeply nested containers. The `-i` flag (interactive-only) dramatically improves scannability but requires users to know about it.
+
+#### Root Cause Analysis
+
+Default snapshot verbosity is set to 'full AX tree' without viewport filtering. Interactive-only mode (`-i`) exists but is opt-in.
+
+#### Code Pointer
+
+`cli/browser4-cli/src/snapshot.rs — default snapshot verbosity level.`
+
+#### AI Suggested Improvement
+
+- Consider making `-i` (interactive only) the default for `snapshot`, with `-v 0` or `--full` to get the full tree
+- Or add a `--brief` flag as an alias for `-i` for discoverability
+- The SKILL.md does a good job explaining `-i` vs `-v 0` vs default; the issue is the CLI default, not the docs
+
+#### Human Review
+
+- [ ] **ACCEPT** — issue confirmed valid; suggested improvement is correct
+- [ ] **ACCEPT with improvements** — issue valid but fix needs refinement (add details in Notes)
+- [ ] **DEFER** — issue acknowledged but intentionally deferred (add rationale in Notes)
+- [ ] **WONTFIX** — issue acknowledged but will not be fixed (add rationale in Notes)
+- [ ] **REJECT** — issue invalid, not a problem, or already addressed
+- [ ] **DUPLICATE** — issue duplicates another existing issue (reference in Notes)
+- **Notes:**
+
+---
+
+## Overall Assessment
+
+**Completion Status:** Partially Successful — all 7 acceptance criteria were exercised and all branches of SKILL.md §4a were covered. AC1 (interact-then-extract) required a workaround (eval instead of htmlsnapshot) because htmlsnapshot only captures initial HTML. AC7 (crawl) was slow and required selector debugging due to inconsistent CSS between page types.
+
+**Success Rate:** 85% — 6 of 7 ACs completed without significant issues. AC1 path was broken for the documented htmlsnapshot approach but worked with eval. AC7 was functionally correct but slow and required selector workaround.
+
+**Issues Found:** 9
+
+**Major Blockers:** htmlsnapshot cannot extract from JS-modified DOM — this is the primary architectural limitation and directly blocks the AC1 'interact then extract with htmlsnapshot' workflow. The docs correctly warn about this, but the task scenario is structured to require it, creating a trap for new users.
+
+**Most Confusing Aspects:** 1) The distinction between snapshot (accessibility tree) vs htmlsnapshot (initial HTML) vs eval (live DOM) — getting the right tool for each scenario requires reading multiple sections of docs. 2) The `get text` → htmlsnapshot error loop when extracting post-interaction content. 3) CSS selector inconsistency between MockSite page types makes X-SQL queries fragile. 4) The crawl 'waiting for first page' lockup reads as a hang.
+
+**Most Valuable Improvements:** 1) Live-DOM capture mode for htmlsnapshot to fix post-interaction extraction. 2) Faster crawl processing with parallel fetch and progressive output. 3) Better error messages that break the get-text/htmlsnapshot loop. 4) Cleaner extract output format (stdout JSON).
+
+**Usability Rating:** 6/10
+
+---
+
+## How to Reproduce
+
+### Common Setup
+
+1. Clone the repository and `cd` to the repo root.
+2. The CLI is invoked via `./b4w.ps1` (PowerShell) or `./b4w.sh` (Bash / Git Bash), which auto-build from source when needed.
+3. The backend server starts automatically in dev mode.
+4. All commands from repo root:
+
+   - **PowerShell:** `./b4w.ps1 <command>`
+   - **Bash / Git Bash:** `./b4w.sh <command>`
+   - **Direct:** `browser4-cli <command>` (if installed globally)
+
+   > **Note:** `$(./b4w.ps1)` is command substitution in bash — do NOT use it.
+
+### Per-Issue Reproduction Steps
+
+#### Issue 1: htmlsnapshot cannot extract JS-modified content after page interaction
+
+1. Go to form-filling page
+2. Fill and submit the form
+3. Run `htmlsnapshot capture` then `htmlsnapshot get text ".result-panel"`
+4. Observe "No elements matched" error even though the result panel is visible in the accessibility tree
+
+#### Issue 2: get text command returns unhelpful redirect loop error for JS-modified content
+
+1. Submit a form that modifies the DOM via JS
+2. Run `get text ".result-panel"`
+3. Observe error: "use htmlsnapshot get text" as suggested workaround
+
+#### Issue 3: Crawl --depth 0 is excessively slow for seed-file bulk extraction
+
+Run `crawl --seed-file urls.txt --depth 0 --sql @query.sql --format table --refresh` with 4 localhost URLs. Observe ~96s total time with ~90s of "waiting for first page" before any progress.
+
+#### Issue 4: Crawl progress UX lacks detail during long 'waiting for first page' phase
+
+Run a crawl with any seed file. Observe repeated 'Crawling... waiting for first page (Xs elapsed, N URLs queued)' messages with no indication of what work is happening.
+
+#### Issue 5: extract command output format is file-based and less ergonomic than eval --json
+
+Run `extract 'Return product title, price, rating as JSON.'`. The output says: '[Extracted content](/path/to/extract-....txt)' pointing to a file.
+
+#### Issue 6: Inconsistent CSS class naming between listing and product detail pages on MockSite
+
+On listing page: `.product-price` exists for each product card. On detail page: price uses `.price-row` not `.product-price`. A crawl query using `.product-price` returns empty prices on detail pages.
+
+#### Issue 7: htmlsnapshot inspect auto-discovers wrong repeating pattern on product detail pages
+
+On `/ec/dp/B0E000001`, run `htmlsnapshot capture` then `htmlsnapshot inspect`. The tool auto-discovers `.recommendation-card` (the 'Customers also viewed' section) as the repeating pattern instead of the primary product info section.
+
+#### Issue 8: First invocation latency requires patience but is well-documented
+
+Run `./b4w.ps1 goto <url>` for the first time in a session. The first command takes ~10s while JVM + Spring Boot start.
+
+#### Issue 9: snapshot output is verbose by default — interactive elements hidden in noise
+
+Run `snapshot --stdout` on a moderately complex page. Output includes every generic container, div, and non-interactive element in the accessibility tree.
+

@@ -1,0 +1,294 @@
+{
+  "meta": {
+    "source": "20260810-175058-comprehensive-ecommerce-workflow.full.md",
+    "mode": "dev",
+    "scenario": "comprehensive-ecommerce-workflow",
+    "date": "20260810-175058"
+  },
+  "background": {
+    "executionContext": "| Step | Command | Outcome |\n|------|---------|---------|\n| 0 | Verified pwd at repo root | OK |\n| 0 | Read `./b4w.ps1 help` + `SKILL.md` | OK |\n| 1 | `goto \"http://localhost:18080/ec/\"` | OK — session created, page loaded |\n| 2 | `snapshot -v 0 --stdout` | OK — full viewport AX tree |\n| 3 | `snapshot -i --stdout` | OK — interactive elements (verbose) |\n| 4 | `click e134` (first product link) | OK — navigate to product detail |\n| 5 | `htmlsnapshot` | OK — captured 15KB snapshot |\n| 6 | `htmlsnapshot inspect --max 3 --depth 2` | Partial — auto-discovered recommendation cards, not main product |\n| 7 | `htmlsnapshot get all text \"#details\"` + `eval --base64` | OK via eval workaround |\n| 8 | X-SQL `@file` query | OK — extracted title/price/image |\n| 9 | `htmlsnapshot grep 'price.*\\$'` | OK — found price patterns |\n| 10 | `extract \"Extract product...\"` | OK — LLM extraction returned structured JSON |\n| 11 | `tab-new \"http://...\"` | OK — created tab, auto-switched |\n| 12 | `htmlsnapshot` + `get all text` | OK — 6 titles + 6 prices |\n| 13 | `eval --base64 ... --json` | OK — counted 6 product links |\n| 14 | `screenshot \".test-sessions/...\"` | **Issue** — saved to default dir, not specified path |\n| 15 | `tab-select 0` + `reload` + `snapshot` | OK |\n| 16 | `snapshot grep -i \"OLED\\|HDR\\|inch...\"` | OK — found attribute text |\n| 17 | `state-save \".test-sessions/...\"` | OK — saved cookies+localStorage |\n| 18 | Summary report written | OK |\n\n**Workaround required for Step 7:** `htmlsnapshot get all text` with CSS class selectors for the product description area returned empty arrays. Used `eval` with base64-encoded JavaScript to access the live DOM instead.\n\n**Workaround required for Step 14:** The positional argument to `screenshot` is a CSS selector, not a filename. Should have used `--filename`/`-o` flag.\n\n---",
+    "task": "The task completed successfully. All 18 steps were executed:\n\n- **Product Detail Page (4K OLED TV 55):** Title, price ($899.99), image URL, description, features (55 inch, HDR10+, OLED panel, 3840x2160 resolution), stock status, and category were extracted via multiple methods (htmlsnapshot get, X-SQL query, eval, extract).\n- **Electronics Listing Page:** 6 products extracted with titles and prices.\n- **Browser state** saved to `.test-sessions/browser-state-2026-08-10.json`.\n- **Summary report** written to `.test-sessions/product-summary-report.md`."
+  },
+  "issues": [
+    {
+      "number": 1,
+      "title": "screenshot positional argument misinterpreted as CSS selector instead of filename",
+      "severity": "Medium",
+      "category": "UX",
+      "sections": [
+        {
+          "label": "Reproduction",
+          "body": "./b4w.ps1 screenshot \".test-sessions/my-file.png\""
+        },
+        {
+          "label": "Expected Behavior",
+          "body": "Screenshot saved to .test-sessions/my-file.png, or an error message that the path is not a valid CSS selector."
+        },
+        {
+          "label": "Actual Behavior",
+          "body": "Screenshot saved to default .browser4-cli/snapshot/screenshot-<timestamp>.png with no error or warning about the ignored argument. The 3-byte file suggests a broken capture."
+        },
+        {
+          "label": "Root Cause Analysis",
+          "body": "The positional argument to `screenshot` is defined as `[ref]` (CSS selector or snapshot ref), not a filename. The `--filename`/`-o` flag must be used for custom paths. The CLI silently treats an invalid path as an unresolved CSS selector and falls back to a full-page screenshot saved at the default location, without warning the user."
+        },
+        {
+          "label": "Code Pointer",
+          "body": "cli/browser4-cli/src/commands/screenshot.rs: argument parsing and resolution logic"
+        },
+        {
+          "label": "AI Suggested Improvement",
+          "body": "- When the positional argument contains a path separator (/ or \\) and does not look like a CSS selector, warn the user that they probably meant --filename\n- Consider a heuristic: if the arg ends in .png/.jpg/.jpeg and doesn't start with #/./[a-zA-Z], suggest --filename\n- Add a tip to screenshot help: \"To specify a filename, use --filename or -o; the positional argument is a CSS selector.\""
+        }
+      ],
+      "review": {
+        "decision": null,
+        "notes": ""
+      }
+    },
+    {
+      "number": 2,
+      "title": "htmlsnapshot inspect auto-discovers wrong container pattern when no selector given",
+      "severity": "Medium",
+      "category": "UX",
+      "sections": [
+        {
+          "label": "Reproduction",
+          "body": "On a product detail page, run `./b4w.ps1 htmlsnapshot inspect --max 3 --depth 2` without specifying a selector."
+        },
+        {
+          "label": "Expected Behavior",
+          "body": "The tool should inspect the main content area (#product-page) or prompt the user to specify a starting selector when multiple repeating patterns exist."
+        },
+        {
+          "label": "Actual Behavior",
+          "body": "The tool auto-discovered `.recommendation-card` elements (the 'Customers also viewed' section at the page bottom) instead of the product detail content. The product's title, price, description, and image selectors were not surfaced."
+        },
+        {
+          "label": "Root Cause Analysis",
+          "body": "Inspect's auto-discovery walks from `:root` looking for sibling-group repeating patterns. The recommendation cards (4 siblings) are more structurally regular than the single product detail container, so they're picked first. The user has no way to direct discovery toward the main content without already knowing the right container selector."
+        },
+        {
+          "label": "Code Pointer",
+          "body": "browser4-core/... (htmlsnapshot inspect logic — auto-discovery heuristic from :root)"
+        },
+        {
+          "label": "AI Suggested Improvement",
+          "body": "- When multiple sibling-group patterns exist, list them all with a summary line so the user can pick one with `inspect <selector>`\n- Prioritize patterns with larger bounding boxes (main content area) over smaller ones (sidebars, recommendations)\n- Add a hint after auto-discovery: \"To inspect the main product area, try: htmlsnapshot inspect '#product-page'\"\n- Document in SKILL.md that `htmlsnapshot inspect` with no selector auto-discovers from :root and may pick sidebars"
+        }
+      ],
+      "review": {
+        "decision": null,
+        "notes": ""
+      }
+    },
+    {
+      "number": 3,
+      "title": "htmlsnapshot get all text with class-based selectors fails silently on product description",
+      "severity": "Medium",
+      "category": "Reliability",
+      "sections": [
+        {
+          "label": "Reproduction",
+          "body": "./b4w.ps1 htmlsnapshot get all text \"#product-page [class*='about']\" on the product detail page after htmlsnapshot capture."
+        },
+        {
+          "label": "Expected Behavior",
+          "body": "Returns text content from elements matching the attribute selector."
+        },
+        {
+          "label": "Actual Behavior",
+          "body": "Returns empty array with message: \"No elements matched. The snapshot may be stale...\" even though the selector was based on observed class names in the page. Multiple attempts with different class patterns ([class*='about'], .about-section, [class*='section']) all returned empty."
+        },
+        {
+          "label": "Root Cause Analysis",
+          "body": "Likely a mismatch between the CSS class names rendered in the stored HTML snapshot and the class patterns being tried. The htmlsnapshot captures initial server HTML, but the class names may not match expected patterns. Alternatively, the attribute selector syntax may have limited support in the htmlsnapshot CSS engine."
+        },
+        {
+          "label": "Code Pointer",
+          "body": "browser4-core/... htmlsnapshot CSS selector engine (class attribute matching)"
+        },
+        {
+          "label": "AI Suggested Improvement",
+          "body": "- When no elements match, suggest using `htmlsnapshot inspect` with a broader selector to discover actual class names\n- Consider adding a `--suggest` flag that prints the top-N class names found in the snapshot when a selector returns empty\n- Document common class name patterns for MockSite product pages in the scenario description"
+        }
+      ],
+      "review": {
+        "decision": null,
+        "notes": ""
+      }
+    },
+    {
+      "number": 4,
+      "title": "Interactive-only snapshot (-i) output is excessively verbose due to parent text accumulation",
+      "severity": "Low",
+      "category": "UX",
+      "sections": [
+        {
+          "label": "Reproduction",
+          "body": "./b4w.ps1 snapshot -i --stdout on a content-rich e-commerce page."
+        },
+        {
+          "label": "Expected Behavior",
+          "body": "Interactive-only snapshot should show clearly delineated interactive elements (buttons, links, inputs) with concise labels."
+        },
+        {
+          "label": "Actual Behavior",
+          "body": "Parent elements accumulate all descendant text into their accessible names. For example, a product card `article` element shows its entire text content concatenated (title + price + rating + description + badge), making it hard to distinguish interactive children from noise."
+        },
+        {
+          "label": "Root Cause Analysis",
+          "body": "The AX tree's accessible name computation for generic container elements includes all descendant text. In `-i` mode, parent containers that have interactive descendants are still shown with their accumulated text names, defeating the purpose of a 'clean' interactive view."
+        },
+        {
+          "label": "Code Pointer",
+          "body": "cli/browser4-cli/src/snapshot rendering — interactive-mode filtering logic"
+        },
+        {
+          "label": "AI Suggested Improvement",
+          "body": "- In `-i` mode, truncate or suppress the accessible name of generic container elements that only serve as wrappers for interactive children\n- Add an `--interactive-flat` mode that shows interactive elements as a flat list without parent hierarchy\n- Consider a `--terse` flag that strips redundant parent text when it's a superset of child text"
+        }
+      ],
+      "review": {
+        "decision": null,
+        "notes": ""
+      }
+    },
+    {
+      "number": 5,
+      "title": "extract command defaults to file output requiring extra read step",
+      "severity": "Low",
+      "category": "UX",
+      "sections": [
+        {
+          "label": "Reproduction",
+          "body": "Run `./b4w.ps1 extract \"product name and price\"` without --stdout."
+        },
+        {
+          "label": "Expected Behavior",
+          "body": "Extracted data displayed inline, or a clear message that --stdout is available for inline output."
+        },
+        {
+          "label": "Actual Behavior",
+          "body": "Output is a file path reference. User must `cat` the file separately to see the content. The tip about --stdout only appears in --help, not in the default output."
+        },
+        {
+          "label": "Root Cause Analysis",
+          "body": "Extract is designed for potentially large outputs, so the default is file-based. However, for quick interactive use, this adds friction. The output message mentions the file path but doesn't hint about --stdout."
+        },
+        {
+          "label": "Code Pointer",
+          "body": "cli/browser4-cli/src/commands/extract.rs"
+        },
+        {
+          "label": "AI Suggested Improvement",
+          "body": "- Add a tip to the extract output: \"Use --stdout to print content directly instead of saving to a file.\"\n- Consider whether the default should be --stdout for short extractions (under a size threshold) and file-based for larger ones\n- Mention the --stdout flag in the SKILL.md extract examples more prominently"
+        }
+      ],
+      "review": {
+        "decision": null,
+        "notes": ""
+      }
+    },
+    {
+      "number": 6,
+      "title": "htmlsnapshot get all prints misleading warning for unique-ID selectors",
+      "severity": "Low",
+      "category": "UX",
+      "sections": [
+        {
+          "label": "Reproduction",
+          "body": "Run `./b4w.ps1 htmlsnapshot get all text \"#product-page\"` on a page where #product-page is a unique container."
+        },
+        {
+          "label": "Expected Behavior",
+          "body": "The output clearly indicates one match was found (expected for a unique ID)."
+        },
+        {
+          "label": "Actual Behavior",
+          "body": "Output says \"Only 1 result(s) found for '#product-page'. The page structure may have changed since the snapshot was captured. Try htmlsnapshot inspect...\" — this reads as a warning/error when 1 result is correct for a unique ID selector."
+        },
+        {
+          "label": "Root Cause Analysis",
+          "body": "The warning logic applies the same message for both genuinely low match counts (stale snapshot) and naturally unique selectors. The threshold is '≤1' which triggers for all ID selectors."
+        },
+        {
+          "label": "Code Pointer",
+          "body": "cli/browser4-cli/src/ — htmlsnapshot get all output formatting logic"
+        },
+        {
+          "label": "AI Suggested Improvement",
+          "body": "- Distinguish between 'no matches' (stale snapshot warning) and '1 match' (normal for IDs, neutral message)\n- Suppress the stale-snapshot warning when the selector contains an #id pattern\n- Change the message for 1-match ID selectors to: \"1 result found (expected for unique ID selector)\""
+        }
+      ],
+      "review": {
+        "decision": null,
+        "notes": ""
+      }
+    },
+    {
+      "number": 7,
+      "title": "Invocation confusion: ./b4w.ps1 vs ./b4w.sh on Linux",
+      "severity": "Low",
+      "category": "Documentation",
+      "sections": [
+        {
+          "label": "Reproduction",
+          "body": "Read CLAUDE.md, SKILL.md, and the task instructions side by side. CLAUDE.md says use ./b4w.sh on Linux; SKILL.md says ./b4w.sh for Linux/macOS; task instructions mandate ./b4w.ps1."
+        },
+        {
+          "label": "Expected Behavior",
+          "body": "A single, consistent invocation command for all platforms, or clear platform-specific guidance that doesn't conflict."
+        },
+        {
+          "label": "Actual Behavior",
+          "body": "Three different sources give different guidance. ./b4w.ps1 worked on Linux because pwsh was installed, but this is an implicit dependency that may not be documented. A first-time Linux user seeing ./b4w.ps1 would be confused."
+        },
+        {
+          "label": "Root Cause Analysis",
+          "body": "The task template mandates ./b4w.ps1 for consistency, but the project's own documentation (CLAUDE.md, SKILL.md) recommends ./b4w.sh for Linux. The .ps1 wrapper delegates to PowerShell which may not be installed on all Linux systems."
+        },
+        {
+          "label": "AI Suggested Improvement",
+          "body": "- Update the task template to use platform-appropriate commands (./b4w.sh on Linux/macOS, ./b4w.ps1 on Windows)\n- Add a note in CLAUDE.md that ./b4w.ps1 requires PowerShell (pwsh) on Linux\n- Consider a single cross-platform wrapper script (e.g., ./b4w) that auto-detects the shell"
+        }
+      ],
+      "review": {
+        "decision": null,
+        "notes": ""
+      }
+    },
+    {
+      "number": 8,
+      "title": "state-save captures no cookies or localStorage despite browsing session",
+      "severity": "Low",
+      "category": "Product",
+      "sections": [
+        {
+          "label": "Reproduction",
+          "body": "Navigate multiple pages, then run `./b4w.ps1 state-save <file>`. Inspect the JSON."
+        },
+        {
+          "label": "Expected Behavior",
+          "body": "If the site sets cookies or localStorage, they should be captured. If not, this should be documented."
+        },
+        {
+          "label": "Actual Behavior",
+          "body": "The saved file contains empty cookies array and empty localStorage per origin. It's unclear whether MockSite doesn't set any storage, or whether state-save has a limitation."
+        },
+        {
+          "label": "Root Cause Analysis",
+          "body": "MockSite likely doesn't set cookies or localStorage (it's a static mock). However, the output doesn't distinguish between 'no storage exists' and 'storage capture failed'. The file is only 118 bytes for a session spanning 2+ pages."
+        },
+        {
+          "label": "AI Suggested Improvement",
+          "body": "- Add a diagnostic message when state-save captures no data: \"No cookies or localStorage found — the site may not set any, or browser storage may be unavailable.\"\n- Add a `--verbose` flag to state-save that lists what was checked per origin\n- Document in SKILL.md that state-save captures whatever the browser has at save time, which may be empty for stateless sites"
+        }
+      ],
+      "review": {
+        "decision": null,
+        "notes": ""
+      }
+    }
+  ]
+}
